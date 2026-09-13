@@ -1,0 +1,12 @@
+**/.git
+**/.github
+**/bin
+**/obj
+**/.vs
+**/.idea
+**/.vscode
+logs
+TestResults
+*.md
+config/secrets*.json
+.env

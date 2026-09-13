@@ -1,0 +1,10 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/FuturesArbBot.App/FuturesArbBot.App.csproj" />
+    <Project Path="src/FuturesArbBot.Core/FuturesArbBot.Core.csproj" />
+    <Project Path="src/FuturesArbBot.Infrastructure/FuturesArbBot.Infrastructure.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/FuturesArbBot.Tests/FuturesArbBot.Tests.csproj" />
+  </Folder>
+</Solution>

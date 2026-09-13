@@ -1,0 +1,67 @@
+{
+  "_comment": "Список бирж. Id — идентификаторы CCXT. Включайте/отключайте поля Enabled. API-ключи нужны только для торговли (Testnet/Live); для мониторинга спредов достаточно пустых. Ключи можно задавать через переменные окружения: ARB_BYBIT_API_KEY, ARB_BYBIT_SECRET, ARB_OKX_PASSWORD и т.д.",
+
+  "Exchanges": {
+    "Items": [
+      {
+        "Id": "binanceusdm",
+        "Name": "Binance USD-M Futures",
+        "Enabled": true,
+        "ApiKey": "",
+        "Secret": ""
+      },
+      {
+        "Id": "bybit",
+        "Name": "Bybit Linear",
+        "Enabled": true,
+        "ApiKey": "",
+        "Secret": ""
+      },
+      {
+        "Id": "okx",
+        "Name": "OKX Swap",
+        "Enabled": true,
+        "ApiKey": "",
+        "Secret": "",
+        "Password": ""
+      },
+      {
+        "Id": "gate",
+        "Name": "Gate.io Futures",
+        "Enabled": false,
+        "ApiKey": "",
+        "Secret": ""
+      },
+      {
+        "Id": "mexc",
+        "Name": "MEXC Futures",
+        "Enabled": false,
+        "ApiKey": "",
+        "Secret": ""
+      },
+      {
+        "Id": "kucoinfutures",
+        "Name": "KuCoin Futures",
+        "Enabled": false,
+        "ApiKey": "",
+        "Secret": "",
+        "Password": ""
+      },
+      {
+        "Id": "bitget",
+        "Name": "Bitget USDT-M",
+        "Enabled": false,
+        "ApiKey": "",
+        "Secret": "",
+        "Password": ""
+      },
+      {
+        "Id": "htx",
+        "Name": "HTX Swap",
+        "Enabled": false,
+        "ApiKey": "",
+        "Secret": ""
+      }
+    ]
+  }
+}

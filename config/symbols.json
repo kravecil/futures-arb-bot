@@ -1,0 +1,17 @@
+{
+  "_comment": "Фильтры торговых пар. По умолчанию берутся ВСЕ линейные бессрочные фьючерсы в USDT с оборотом от 5 млн USDT/сутки (самые ликвидные 400). Include — белый список шаблонов (если не пуст, торгуем только его); Exclude — чёрный список. Шаблоны поддерживают * и ?. Примеры: 'BTC/USDT:*' — все контракты BTC/USDT; '*/USDT:USDT' — все линейные; '*UP/USDT:*' — все с суффиксом UP.",
+
+  "Symbols": {
+    "QuoteCurrencies": ["USDT"],
+    "MinQuoteVolume24hUsd": 5000000,
+    "MaxSymbols": 400,
+    "MaxTickerAgeSeconds": 15,
+    "Include": [],
+    "Exclude": [
+      "*UP/USDT:*",
+      "*DOWN/USDT:*",
+      "*BULL/USDT:*",
+      "*BEAR/USDT:*"
+    ]
+  }
+}

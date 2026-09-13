@@ -1,0 +1,22 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- Консольное приложение: DI, дашборд Spectre.Console, отчёты. -->
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <AssemblyName>FuturesArbBot</AssemblyName>
+    <RootNamespace>FuturesArbBot.App</RootNamespace>
+    <TargetFramework>net10.0-windows</TargetFramework>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\FuturesArbBot.Core\FuturesArbBot.Core.csproj" />
+    <ProjectReference Include="..\FuturesArbBot.Infrastructure\FuturesArbBot.Infrastructure.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Extensions.Hosting" />
+    <PackageReference Include="Spectre.Console" />
+  </ItemGroup>
+
+</Project>

@@ -1,0 +1,11 @@
+global using System.Globalization;
+global using FuturesArbBot.App.Ui;
+global using FuturesArbBot.Core.Abstractions;
+global using FuturesArbBot.Core.Domain;
+global using FuturesArbBot.Core.Engine;
+global using FuturesArbBot.Infrastructure.Ccxt;
+global using FuturesArbBot.Infrastructure.Configuration;
+global using Microsoft.Extensions.DependencyInjection;
+global using Microsoft.Extensions.Logging;
+global using Spectre.Console;
+global using Spectre.Console.Rendering;
