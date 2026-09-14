@@ -108,7 +108,7 @@ public sealed class StatisticsCollector(IConfigProvider config, TimeProvider tim
             position.Symbol,
             position.LongExchangeId,
             position.ShortExchangeId,
-            position.Size,
+            position.MatchedSize,
             position.EntryLong,
             position.EntryShort,
             position.ExitLong,

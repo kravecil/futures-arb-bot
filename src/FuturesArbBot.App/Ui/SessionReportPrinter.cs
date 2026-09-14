@@ -98,7 +98,7 @@ public sealed class SessionReportPrinter(IEventLog log)
                 Markup.Escape(position.Symbol),
                 $"{Markup.Escape(position.LongExchangeId)} @ {Formatting.Price(position.EntryLong)}",
                 $"{Markup.Escape(position.ShortExchangeId)} @ {Formatting.Price(position.EntryShort)}",
-                Formatting.Volume(position.Size),
+                Formatting.Volume(position.MatchedSize),
                 position.OpenedAt.ToLocalTime().ToString("HH:mm:ss"));
         }
 

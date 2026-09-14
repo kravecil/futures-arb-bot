@@ -30,12 +30,14 @@ public sealed record TickerSnapshot(
     public bool IsTradable => Bid > 0m && Ask > 0m;
 }
 
-/// <summary>Запрос на рыночный ордер.</summary>
+/// <summary>Запрос на ордер (рыночный или лимитный). Для лимитного обязана быть задана цена.</summary>
 public sealed record OrderRequest(
     string Symbol,
     OrderSide Side,
     decimal Amount,
-    bool ReduceOnly = false);
+    bool ReduceOnly = false,
+    OrderType Type = OrderType.Market,
+    decimal? Price = null);
 
 /// <summary>Результат исполнения ордера.</summary>
 public sealed record OrderResult

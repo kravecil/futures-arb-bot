@@ -206,7 +206,8 @@ public sealed class ArbTradeExecutor(
             Symbol = estimate.Symbol,
             LongExchangeId = longConnector.Id,
             ShortExchangeId = shortConnector.Id,
-            Size = Math.Min(buy.FilledAmount, sell.FilledAmount),
+            LongSize = buy.FilledAmount,
+            ShortSize = sell.FilledAmount,
             EntryLong = buy.AveragePrice ?? estimate.LongLeg.Price,
             EntryShort = sell.AveragePrice ?? estimate.ShortLeg.Price,
             FeesEntryUsd = fees,
@@ -220,7 +221,7 @@ public sealed class ArbTradeExecutor(
         }
 
         stats.RecordOpened(position);
-        log.Success($"Открыт арбитраж {position.Symbol}: {position.Size} × лонг {position.LongExchangeId} @ {Formatting.Price(position.EntryLong)} / шорт {position.ShortExchangeId} @ {Formatting.Price(position.EntryShort)}");
+        log.Success($"Открыт арбитраж {position.Symbol}: {Formatting.Volume(position.MatchedSize)} × лонг {position.LongExchangeId} @ {Formatting.Price(position.EntryLong)} / шорт {position.ShortExchangeId} @ {Formatting.Price(position.EntryShort)}");
     }
 
     private void OpenSimulated(SpreadEstimate estimate, decimal amount, ArbitrageOptions options)
@@ -235,7 +236,8 @@ public sealed class ArbTradeExecutor(
             Symbol = estimate.Symbol,
             LongExchangeId = estimate.LongLeg.ExchangeId,
             ShortExchangeId = estimate.ShortLeg.ExchangeId,
-            Size = amount,
+            LongSize = amount,
+            ShortSize = amount,
             EntryLong = estimate.LongLeg.Price,
             EntryShort = estimate.ShortLeg.Price,
             FeesEntryUsd = fees,
@@ -275,7 +277,7 @@ public sealed class ArbTradeExecutor(
         else
         {
             var closeLong = await longConnector.PlaceMarketOrderAsync(
-                new OrderRequest(position.Symbol, OrderSide.Sell, position.Size, ReduceOnly: true), ct);
+                new OrderRequest(position.Symbol, OrderSide.Sell, position.MatchedSize, ReduceOnly: true), ct);
             if (!closeLong.Success)
             {
                 log.Error($"[{longConnector.DisplayName}] закрытие лонга {position.Symbol} не удалось: {closeLong.Error}");
@@ -283,7 +285,7 @@ public sealed class ArbTradeExecutor(
             }
 
             var closeShort = await shortConnector.PlaceMarketOrderAsync(
-                new OrderRequest(position.Symbol, OrderSide.Buy, position.Size, ReduceOnly: true), ct);
+                new OrderRequest(position.Symbol, OrderSide.Buy, position.MatchedSize, ReduceOnly: true), ct);
             if (!closeShort.Success)
             {
                 log.Error($"[{shortConnector.DisplayName}] закрытие шорта {position.Symbol} не удалось: {closeShort.Error}");
@@ -298,13 +300,13 @@ public sealed class ArbTradeExecutor(
 
         var exitLong = position.ExitLong ?? position.EntryLong;
         var exitShort = position.ExitShort ?? position.EntryShort;
-        position.FeesExitUsd = EstimateFees(longConnector, shortConnector, position.Symbol, exitLong, exitShort, position.Size);
+        position.FeesExitUsd = EstimateFees(longConnector, shortConnector, position.Symbol, exitLong, exitShort, position.MatchedSize);
         position.Reason = reason;
         position.ClosedAt = time.GetUtcNow();
         position.Status = PositionStatus.Closed;
 
         // лонг: (exit − entry); шорт: (entry − exit); минус комиссии обеих сторон
-        position.RealizedPnlUsd = position.Size * ((exitLong - position.EntryLong) + (position.EntryShort - exitShort))
+        position.RealizedPnlUsd = position.MatchedSize * ((exitLong - position.EntryLong) + (position.EntryShort - exitShort))
                                   - position.FeesEntryUsd - position.FeesExitUsd;
 
         lock (_positions)

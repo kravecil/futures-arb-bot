@@ -30,8 +30,17 @@ public sealed class PositionPair
 
     public required string ShortExchangeId { get; init; }
 
-    /// <summary>Размер в базовой валюте (монетах).</summary>
-    public required decimal Size { get; set; }
+    /// <summary>Фактически набранный объём лонга в базовой валюте (монетах).</summary>
+    public required decimal LongSize { get; set; }
+
+    /// <summary>Фактически набранный объём шорта в базовой валюте (монетах).</summary>
+    public required decimal ShortSize { get; set; }
+
+    /// <summary>Согласованный (встречный) объём позиции — минимум из двух ног.</summary>
+    public decimal MatchedSize => Math.Min(LongSize, ShortSize);
+
+    /// <summary>Перекос ног: положителен — больше лонг, отрицателен — больше шорт.</summary>
+    public decimal Imbalance => LongSize - ShortSize;
 
     public required decimal EntryLong { get; set; }
 

@@ -20,6 +20,16 @@ public enum OrderSide
     Sell,
 }
 
+/// <summary>Тип ордера.</summary>
+public enum OrderType
+{
+    /// <summary>Рыночный: исполняется сразу по доступной ликвидности.</summary>
+    Market,
+
+    /// <summary>Лимитный: исполняется по указанной цене или лучше.</summary>
+    Limit,
+}
+
 /// <summary>Статус арбитражной позиции.</summary>
 public enum PositionStatus
 {
