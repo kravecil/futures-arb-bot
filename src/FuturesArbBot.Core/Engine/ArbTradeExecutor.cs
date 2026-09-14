@@ -155,6 +155,28 @@ public sealed class ArbTradeExecutor(
 
     // ------------------------- открытие -------------------------
 
+    /// <summary>Состояние исполнения одной limit-ноги при открытии.</summary>
+    private sealed class LegState
+    {
+        public required IExchangeConnector Connector { get; init; }
+
+        public required OrderRequest Request { get; init; }
+
+        public string? OrderId { get; set; }
+
+        public decimal Filled { get; set; }
+
+        public decimal? AveragePrice { get; set; }
+
+        public string? Error { get; set; }
+
+        /// <summary>Нога исполнена полностью.</summary>
+        public bool Done { get; set; }
+
+        /// <summary>Нога мертва: отклонена, отменена, истекла или пропала.</summary>
+        public bool Dead { get; set; }
+    }
+
     private async Task OpenAsync(SpreadEstimate estimate, ArbitrageOptions options, CancellationToken ct)
     {
         var mode = config.Current.General.NetworkMode;
@@ -177,39 +199,216 @@ public sealed class ArbTradeExecutor(
             return;
         }
 
-        log.Info($"Открываю арбитраж {estimate.Symbol}: BUY {Formatting.Volume(amount.Value)} на {longConnector.DisplayName}, SELL на {shortConnector.DisplayName} (нетто {Formatting.Pct(estimate.NetPercent)})");
+        log.Info($"Открываю арбитраж {estimate.Symbol}: limit BUY {Formatting.Volume(amount.Value)} @ {Formatting.Price(estimate.LongLeg.Price)} на {longConnector.DisplayName}, limit SELL @ {Formatting.Price(estimate.ShortLeg.Price)} на {shortConnector.DisplayName} (нетто {Formatting.Pct(estimate.NetPercent)})");
 
         await longConnector.SetLeverageAsync(options.Leverage, estimate.Symbol, ct);
         await shortConnector.SetLeverageAsync(options.Leverage, estimate.Symbol, ct);
 
-        var buy = await longConnector.PlaceOrderAsync(new OrderRequest(estimate.Symbol, OrderSide.Buy, amount.Value), ct);
-        if (!buy.Success)
+        // Marketable limit: покупка по ask дешёвой биржи, продажа по bid дорогой —
+        // исполнение сразу при наличии ликвидности, но не хуже указанной цены.
+        LegState longLeg = new()
         {
-            stats.RecordOpenFailed(estimate.Symbol, buy.Error ?? "неизвестная ошибка");
+            Connector = longConnector,
+            Request = new OrderRequest(estimate.Symbol, OrderSide.Buy, amount.Value, Type: OrderType.Limit, Price: estimate.LongLeg.Price),
+        };
+        LegState shortLeg = new()
+        {
+            Connector = shortConnector,
+            Request = new OrderRequest(estimate.Symbol, OrderSide.Sell, amount.Value, Type: OrderType.Limit, Price: estimate.ShortLeg.Price),
+        };
+        LegState[] legs = [longLeg, shortLeg];
+
+        // 1) выставляем ноги последовательно: отказ первой — вторая не выставляется вообще
+        foreach (var leg in legs)
+        {
+            if (!await PlaceAsync(leg, ct))
+            {
+                var failReason = $"limit {leg.Request.Side} на {leg.Connector.DisplayName} отклонён: {leg.Error}";
+                log.Error($"{estimate.Symbol}: {failReason}; вторая нога не выставляется");
+                await AbortLegsAsync(legs, ct);
+                stats.RecordOpenFailed(estimate.Symbol, failReason);
+                return;
+            }
+        }
+
+        // 2) ждём полного исполнения обеих ног (или смерти заявки/таймаута)
+        await WaitForLegsAsync(legs, options, ct);
+
+        // 3) если что-то не исполнено — отменяем живые заявки и откатываем набранное
+        if (legs.Any(l => !l.Done))
+        {
+            var reasons = string.Join("; ", legs.Where(l => !l.Done)
+                .Select(l => $"{l.Request.Side} на {l.Connector.DisplayName}: {l.Error ?? (l.Dead ? "заявка мертва" : "не исполнена вовремя")}"));
+            log.Error($"{estimate.Symbol}: открытие не удалось ({reasons}); отменяю и откатываю ноги");
+            var (residualLong, residualShort) = await AbortLegsAsync(legs, ct);
+            stats.RecordOpenFailed(estimate.Symbol, reasons);
+
+            if (residualLong > 0m || residualShort > 0m)
+            {
+                // откат прошёл не полностью — регистрируем «кривую» позицию,
+                // чтобы цикл ведения и ребалансировки довёл её до конца
+                RegisterPartialPosition(estimate, longLeg, shortLeg, residualLong, residualShort);
+            }
+
             return;
         }
 
-        var sell = await shortConnector.PlaceOrderAsync(new OrderRequest(estimate.Symbol, OrderSide.Sell, amount.Value), ct);
-        if (!sell.Success)
+        // 4) успех — позиция с раздельными объёмами ног
+        RegisterPosition(estimate, longLeg, shortLeg);
+    }
+
+    /// <summary>Выставить limit-ордер ноги. false — биржа отказала (нога мертва).</summary>
+    private async Task<bool> PlaceAsync(LegState leg, CancellationToken ct)
+    {
+        var result = await leg.Connector.PlaceOrderAsync(leg.Request, ct);
+        if (!result.Success)
         {
-            // вторая нога не прошла — срочно закатываем первую (reduceOnly)
-            log.Error($"[{shortConnector.DisplayName}] шорт не открылся ({sell.Error}); откатываю лонг");
-            await longConnector.PlaceOrderAsync(new OrderRequest(estimate.Symbol, OrderSide.Sell, amount.Value, ReduceOnly: true), CancellationToken.None);
-            stats.RecordOpenFailed(estimate.Symbol, $"шорт не открыт: {sell.Error}");
-            return;
+            leg.Error = result.Error ?? "ордер отклонён";
+            leg.Dead = true;
+            log.Error($"[{leg.Connector.DisplayName}] limit {leg.Request.Side} {leg.Request.Symbol} не выставлен: {leg.Error}");
+            return false;
         }
 
-        var fees = EstimateFees(longConnector, shortConnector, estimate.Symbol, buy.AveragePrice ?? estimate.LongLeg.Price, sell.AveragePrice ?? estimate.ShortLeg.Price, amount.Value);
+        leg.OrderId = result.OrderId;
+        leg.Filled = result.FilledAmount;
+        leg.AveragePrice = result.AveragePrice;
+        leg.Done = leg.Filled >= leg.Request.Amount;
+        return true;
+    }
+
+    /// <summary>Опрашивает ноги до полного исполнения, смерти заявки или истечения таймаута.</summary>
+    private async Task WaitForLegsAsync(LegState[] legs, ArbitrageOptions options, CancellationToken ct)
+    {
+        var deadline = time.GetUtcNow() + TimeSpan.FromMilliseconds(options.OrderExecutionTimeoutMs);
+        while (true)
+        {
+            var pending = legs.Where(l => !l.Done && !l.Dead).ToList();
+            if (pending.Count == 0)
+            {
+                break;
+            }
+
+            foreach (var leg in pending)
+            {
+                if (leg.OrderId is null)
+                {
+                    leg.Dead = true;
+                    continue;
+                }
+
+                var update = await leg.Connector.FetchOrderAsync(leg.OrderId, leg.Request.Symbol, ct);
+                if (update is null)
+                {
+                    leg.Dead = true;
+                    leg.Error ??= "заявка не найдена при опросе";
+                    continue;
+                }
+
+                leg.Filled = Math.Max(leg.Filled, update.FilledAmount);
+                leg.AveragePrice = update.AveragePrice ?? leg.AveragePrice;
+                if (update.IsFilled)
+                {
+                    leg.Done = true;
+                }
+                else if (update.IsDead)
+                {
+                    leg.Dead = true;
+                }
+            }
+
+            if (time.GetUtcNow() >= deadline)
+            {
+                foreach (var leg in legs.Where(l => !l.Done && !l.Dead))
+                {
+                    leg.Error = $"не исполнена за {options.OrderExecutionTimeoutMs} мс, набрано {Formatting.Volume(leg.Filled)}";
+                }
+
+                break;
+            }
+
+            await Task.Delay(options.OrderPollIntervalMs, ct);
+        }
+    }
+
+    /// <summary>
+    /// Отменяет живые заявки обеих ног и откатывает набранный объём market reduceOnly (с ретраями).
+    /// Возвращает остатки (long, short), которые не удалось откатить.
+    /// </summary>
+    private async Task<(decimal Long, decimal Short)> AbortLegsAsync(LegState[] legs, CancellationToken ct)
+    {
+        var residuals = new decimal[legs.Length];
+
+        for (var i = 0; i < legs.Length; i++)
+        {
+            var leg = legs[i];
+
+            // добиваемся отмены: после cancel перечитываем финальное состояние (гонка отмены и исполнения)
+            if (!leg.Done && !leg.Dead && leg.OrderId is not null)
+            {
+                for (var attempt = 0; attempt < 3 && !leg.Dead; attempt++)
+                {
+                    await leg.Connector.CancelOrderAsync(leg.OrderId, leg.Request.Symbol, CancellationToken.None);
+                    var update = await leg.Connector.FetchOrderAsync(leg.OrderId, leg.Request.Symbol, CancellationToken.None);
+                    if (update is null || update.IsDead)
+                    {
+                        leg.Filled = update?.FilledAmount ?? leg.Filled;
+                        leg.Dead = true;
+                    }
+                    else if (update.IsFilled)
+                    {
+                        leg.Filled = update.FilledAmount;
+                        leg.AveragePrice = update.AveragePrice ?? leg.AveragePrice;
+                        leg.Done = true;
+                    }
+                }
+            }
+
+            // откат набранного — market reduceOnly с ретраями
+            var remaining = leg.Filled;
+            var closeSide = leg.Request.Side == OrderSide.Buy ? OrderSide.Sell : OrderSide.Buy;
+            for (var attempt = 0; attempt < 3 && remaining > 0m; attempt++)
+            {
+                var rollback = await leg.Connector.PlaceOrderAsync(
+                    new OrderRequest(leg.Request.Symbol, closeSide, remaining, ReduceOnly: true), CancellationToken.None);
+                if (rollback.Success)
+                {
+                    remaining -= rollback.FilledAmount > 0m ? rollback.FilledAmount : remaining;
+                }
+                else
+                {
+                    log.Error($"[{leg.Connector.DisplayName}] откат {closeSide} {leg.Request.Symbol} × {remaining} не прошёл (попытка {attempt + 1}): {rollback.Error}");
+                    await Task.Delay(250, CancellationToken.None);
+                }
+            }
+
+            residuals[i] = Math.Max(remaining, 0m);
+            if (residuals[i] > 0m)
+            {
+                log.Error($"[{leg.Connector.DisplayName}] после откатов остаётся {leg.Request.Side} × {Formatting.Volume(residuals[i])} — передаю цикл ведения");
+            }
+        }
+
+        _ = ct; // откат выполняется по CancellationToken.None: он важнее выхода из процесса
+        return (residuals[0], residuals[1]);
+    }
+
+    /// <summary>Регистрирует полностью открытую позицию по факту исполнения обеих ног.</summary>
+    private void RegisterPosition(SpreadEstimate estimate, LegState longLeg, LegState shortLeg)
+    {
+        var entryLong = longLeg.AveragePrice ?? estimate.LongLeg.Price;
+        var entryShort = shortLeg.AveragePrice ?? estimate.ShortLeg.Price;
+        var fees = EstimateFees(longLeg.Connector, shortLeg.Connector, estimate.Symbol, entryLong, entryShort, longLeg.Filled);
+
         var position = new PositionPair
         {
             Id = Guid.NewGuid(),
             Symbol = estimate.Symbol,
-            LongExchangeId = longConnector.Id,
-            ShortExchangeId = shortConnector.Id,
-            LongSize = buy.FilledAmount,
-            ShortSize = sell.FilledAmount,
-            EntryLong = buy.AveragePrice ?? estimate.LongLeg.Price,
-            EntryShort = sell.AveragePrice ?? estimate.ShortLeg.Price,
+            LongExchangeId = longLeg.Connector.Id,
+            ShortExchangeId = shortLeg.Connector.Id,
+            LongSize = longLeg.Filled,
+            ShortSize = shortLeg.Filled,
+            EntryLong = entryLong,
+            EntryShort = entryShort,
             FeesEntryUsd = fees,
             OpenedAt = time.GetUtcNow(),
             Simulated = false,
@@ -222,6 +421,39 @@ public sealed class ArbTradeExecutor(
 
         stats.RecordOpened(position);
         log.Success($"Открыт арбитраж {position.Symbol}: {Formatting.Volume(position.MatchedSize)} × лонг {position.LongExchangeId} @ {Formatting.Price(position.EntryLong)} / шорт {position.ShortExchangeId} @ {Formatting.Price(position.EntryShort)}");
+    }
+
+    /// <summary>
+    /// Регистрирует позицию после неудачного открытия с остатками откатов:
+    /// объёмы ног различаются — ребалансировка и закрытие доведут её до конца.
+    /// </summary>
+    private void RegisterPartialPosition(SpreadEstimate estimate, LegState longLeg, LegState shortLeg, decimal residualLong, decimal residualShort)
+    {
+        var entryLong = longLeg.AveragePrice ?? estimate.LongLeg.Price;
+        var entryShort = shortLeg.AveragePrice ?? estimate.ShortLeg.Price;
+
+        var position = new PositionPair
+        {
+            Id = Guid.NewGuid(),
+            Symbol = estimate.Symbol,
+            LongExchangeId = longLeg.Connector.Id,
+            ShortExchangeId = shortLeg.Connector.Id,
+            LongSize = residualLong,
+            ShortSize = residualShort,
+            EntryLong = entryLong,
+            EntryShort = entryShort,
+            FeesEntryUsd = EstimateFees(longLeg.Connector, shortLeg.Connector, estimate.Symbol, entryLong, entryShort, Math.Max(residualLong, residualShort)),
+            OpenedAt = time.GetUtcNow(),
+            Simulated = false,
+        };
+
+        lock (_positions)
+        {
+            _positions[position.Symbol] = position;
+        }
+
+        stats.RecordOpened(position);
+        log.Warning($"{position.Symbol}: после отката остались ножки — лонг {Formatting.Volume(position.LongSize)} / шорт {Formatting.Volume(position.ShortSize)}, позиция передана циклу ведения");
     }
 
     private void OpenSimulated(SpreadEstimate estimate, decimal amount, ArbitrageOptions options)

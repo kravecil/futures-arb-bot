@@ -95,6 +95,17 @@ public sealed class ArbitrageOptions
     [Range(0.5, 1000)]
     public decimal MaxSpreadPercent { get; set; } = 5m;
 
+    /// <summary>
+    /// Таймаут (мс) ожидания полного исполнения limit-ног при открытии.
+    /// По истечении — неисполненные ноги отменяются, набранный объём откатывается.
+    /// </summary>
+    [Range(200, 600_000)]
+    public int OrderExecutionTimeoutMs { get; set; } = 3_000;
+
+    /// <summary>Период (мс) опроса статусов limit-ордеров при ожидании исполнения.</summary>
+    [Range(50, 10_000)]
+    public int OrderPollIntervalMs { get; set; } = 200;
+
     /// <summary>Номинал одного арбитража в USDT (на каждую ногу).</summary>
     [Range(1, 10_000_000)]
     public decimal OrderSizeUsd { get; set; } = 100m;
