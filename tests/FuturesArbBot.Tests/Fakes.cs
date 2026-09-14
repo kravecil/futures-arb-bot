@@ -68,8 +68,8 @@ public sealed class FakeConnector : IExchangeConnector
     /// <summary>Состояния фейковых ордеров: orderId → снимок (тесты могут менять до опроса).</summary>
     public Dictionary<string, OrderUpdate> OrderStates { get; } = new(StringComparer.Ordinal);
 
-    /// <summary>Переопределение поведения размещения: вернуть Fail/Ok — тестовая проводка сбоев.</summary>
-    public Func<OrderRequest, int, OrderResult>? PlaceOrderOverride { get; set; }
+    /// <summary>Переопределение поведения размещения: вернуть Fail/Ok — тестовая проводка сбоев; null — дефолт (полное исполнение).</summary>
+    public Func<OrderRequest, int, OrderResult?>? PlaceOrderOverride { get; set; }
 
     /// <summary>Если true — фейковый limit исполняется «наполовину» при первом опросе статуса.</summary>
     public bool LimitPartiallyFills { get; set; }
@@ -114,6 +114,9 @@ public sealed class FakeConnector : IExchangeConnector
         return Task.FromResult<OrderUpdate?>(state);
     }
 
+    /// <summary>Отменённые через фейк заявки (orderId).</summary>
+    public List<string> CancelledOrders { get; } = [];
+
     public Task<bool> CancelOrderAsync(string orderId, string symbol, CancellationToken ct = default)
     {
         if (!OrderStates.TryGetValue(orderId, out var state) || state.Status != OrderStatus.Open)
@@ -122,6 +125,7 @@ public sealed class FakeConnector : IExchangeConnector
         }
 
         OrderStates[orderId] = state with { Status = OrderStatus.Canceled };
+        CancelledOrders.Add(orderId);
         return Task.FromResult(true);
     }
 
@@ -136,6 +140,18 @@ public sealed class FakeConnector : IExchangeConnector
     }
 
     public ValueTask DisposeAsync() => ValueTask.CompletedTask;
+}
+
+/// <summary>Часы, шагающие вперёд при каждом чтении — чтобы циклы ожидания не зависали.</summary>
+public sealed class SteppingTimeProvider(DateTimeOffset start, TimeSpan step) : TimeProvider
+{
+    private long _reads;
+
+    public override DateTimeOffset GetUtcNow()
+    {
+        var n = Interlocked.Increment(ref _reads) - 1;
+        return start + TimeSpan.FromTicks(step.Ticks * n);
+    }
 }
 
 /// <summary>Тикер-строитель для тестов.</summary>

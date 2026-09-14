@@ -252,8 +252,15 @@ public sealed class ArbTradeExecutor(
             {
                 var failReason = $"limit {leg.Request.Side} на {leg.Connector.DisplayName} отклонён: {leg.Error}";
                 log.Error($"{estimate.Symbol}: {failReason}; вторая нога не выставляется");
-                await AbortLegsAsync(legs, ct);
+                var (residualLong, residualShort) = await AbortLegsAsync(legs, ct);
                 stats.RecordOpenFailed(estimate.Symbol, failReason);
+
+                if (residualLong > 0m || residualShort > 0m)
+                {
+                    // откат набранного не прошёл — позиция остаётся в учёте для цикла ведения
+                    RegisterPartialPosition(estimate, longLeg, shortLeg, residualLong, residualShort);
+                }
+
                 return;
             }
         }
