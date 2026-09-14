@@ -102,6 +102,14 @@ public sealed class ArbitrageOptions
     [Range(200, 600_000)]
     public int OrderExecutionTimeoutMs { get; set; } = 3_000;
 
+    /// <summary>
+    /// Допустимый перекос объёмов ног (% от большего объёма), при котором позиция
+    /// считается сбалансированной. Сверх порога — бóльшая нога урезается reduceOnly limit-ордером.
+    /// Фактический порог не меньше минимального лота биржи.
+    /// </summary>
+    [Range(0.05, 25)]
+    public decimal RebalanceTolerancePercent { get; set; } = 1.0m;
+
     /// <summary>Период (мс) опроса статусов limit-ордеров при ожидании исполнения.</summary>
     [Range(50, 10_000)]
     public int OrderPollIntervalMs { get; set; } = 200;

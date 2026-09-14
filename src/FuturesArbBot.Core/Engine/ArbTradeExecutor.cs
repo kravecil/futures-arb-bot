@@ -79,8 +79,10 @@ public sealed class ArbTradeExecutor(
         UpdateTickerCache(tickersByExchange);
 
         var options = config.Current.Arbitrage;
+        var mode = config.Current.General.NetworkMode;
         var now = time.GetUtcNow();
         List<(PositionPair Position, CloseReason Reason)> toClose = [];
+        List<PositionPair> toRebalance = [];
 
         lock (_positions)
         {
@@ -102,11 +104,24 @@ public sealed class ArbTradeExecutor(
                 if (reason is not null)
                 {
                     toClose.Add((position, reason.Value));
+                    continue;
+                }
+
+                // закрытие ног не завершено — сначала добьём закрытие, не ребалансируя наполовину голые ноги
+                if (position.LongClosed != position.ShortClosed)
+                {
+                    continue;
+                }
+
+                if (mode != NetworkMode.DryRun
+                    && Math.Abs(position.Imbalance) > RebalanceTolerance(position, options))
+                {
+                    toRebalance.Add(position);
                 }
             }
         }
 
-        if (toClose.Count == 0)
+        if (toClose.Count == 0 && toRebalance.Count == 0)
         {
             return;
         }
@@ -114,9 +129,21 @@ public sealed class ArbTradeExecutor(
         await _gate.WaitAsync(ct);
         try
         {
+            var closingSymbols = new HashSet<string>(toClose.Select(x => x.Position.Symbol), StringComparer.Ordinal);
+
             foreach (var (position, reason) in toClose)
             {
                 await CloseAsync(position, reason, ct);
+            }
+
+            foreach (var position in toRebalance)
+            {
+                if (closingSymbols.Contains(position.Symbol))
+                {
+                    continue; // позиция закрывается — перекос закроется вместе с ней
+                }
+
+                await RebalanceAsync(position, options, ct);
             }
         }
         finally
@@ -486,8 +513,133 @@ public sealed class ArbTradeExecutor(
         log.Success($"[СИМУЛЯЦИЯ] Открыт арбитраж {position.Symbol}: {Formatting.Volume(amount)} × лонг {position.LongExchangeId} @ {Formatting.Price(position.EntryLong)} / шорт {position.ShortExchangeId} @ {Formatting.Price(position.EntryShort)} (нетто {Formatting.Pct(estimate.NetPercent)})");
     }
 
+    // ------------------------- ребалансировка -------------------------
+
+    /// <summary>
+    /// Порог допустимого перекоса ног: максимум из настроенного процента от большего
+    /// объёма и минимального лота биржи, которую придётся урезать (меньше лота ордер не встанет).
+    /// </summary>
+    private decimal RebalanceTolerance(PositionPair position, ArbitrageOptions options)
+    {
+        var cutLong = position.Imbalance > 0m;
+        var exchangeId = cutLong ? position.LongExchangeId : position.ShortExchangeId;
+        var connector = registry.Connectors.FirstOrDefault(c => c.Id == exchangeId);
+        var minLot = connector is null ? 0m : FindMarket(connector, position.Symbol)?.MinAmount ?? 0m;
+        var percent = Math.Max(position.LongSize, position.ShortSize) * options.RebalanceTolerancePercent / 100m;
+        return Math.Max(percent, minLot);
+    }
+
+    /// <summary>
+    /// Урезает бóльшую ногу reduceOnly limit-ордером по текущему bid/ask до выравнивания ног.
+    /// Частичное исполнение фиксируется; остаток добирается на следующем тике.
+    /// </summary>
+    private async Task RebalanceAsync(PositionPair position, ArbitrageOptions options, CancellationToken ct)
+    {
+        var cutLong = position.Imbalance > 0m;
+        var exchangeId = cutLong ? position.LongExchangeId : position.ShortExchangeId;
+        var connector = registry.Connectors.FirstOrDefault(c => c.Id == exchangeId);
+        var ticker = FindTicker(exchangeId, position.Symbol);
+        if (connector is null || ticker is null || !ticker.IsTradable)
+        {
+            return;
+        }
+
+        var delta = Math.Abs(position.Imbalance);
+        var price = cutLong ? ticker.Bid : ticker.Ask;
+        if (price <= 0m)
+        {
+            return;
+        }
+
+        var side = cutLong ? OrderSide.Sell : OrderSide.Buy;
+        var leg = new LegState
+        {
+            Connector = connector,
+            Request = new OrderRequest(position.Symbol, side, delta, ReduceOnly: true, Type: OrderType.Limit, Price: price),
+        };
+
+        log.Info($"{position.Symbol}: ребаланс — урезаю {(cutLong ? "лонг" : "шорт")} на {Formatting.Volume(delta)} @ {Formatting.Price(price)} (ноги {Formatting.Volume(position.LongSize)}/{Formatting.Volume(position.ShortSize)})");
+        if (!await PlaceAsync(leg, ct))
+        {
+            return; // отказ — повторим на следующем тике
+        }
+
+        await WaitForLegsAsync([leg], options, ct);
+
+        // по таймауту снимаем заявку и перечитываем финальное исполнение (гонка отмены и исполнения)
+        if (!leg.Done && !leg.Dead && leg.OrderId is not null)
+        {
+            await connector.CancelOrderAsync(leg.OrderId, position.Symbol, CancellationToken.None);
+            var update = await connector.FetchOrderAsync(leg.OrderId, position.Symbol, CancellationToken.None);
+            if (update is not null)
+            {
+                leg.Filled = Math.Max(leg.Filled, update.FilledAmount);
+                leg.AveragePrice = update.AveragePrice ?? leg.AveragePrice;
+            }
+        }
+
+        var cut = Math.Min(leg.Filled, delta);
+        if (cut <= 0m)
+        {
+            log.Warning($"{position.Symbol}: ребаланс не исполнился{(leg.Error is null ? string.Empty : $" ({leg.Error})")} — повторю на следующем тике");
+            return;
+        }
+
+        if (cutLong)
+        {
+            position.LongSize = Math.Max(0m, position.LongSize - cut);
+        }
+        else
+        {
+            position.ShortSize = Math.Max(0m, position.ShortSize - cut);
+        }
+
+        AccruedClosedLeg(position, connector, isLong: cutLong, cut, leg.AveragePrice ?? price);
+        log.Success($"{position.Symbol}: ребаланс — урезано {(cutLong ? "лонг" : "шорт")} на {Formatting.Volume(cut)}, ноги {Formatting.Volume(position.LongSize)}/{Formatting.Volume(position.ShortSize)}");
+
+        if (position.LongSize <= 0m && position.ShortSize <= 0m)
+        {
+            // обрезали остатки откатов до нуля — позиция фактически закрыта
+            await CloseAsync(position, CloseReason.Rollback, ct);
+        }
+    }
+
+    /// <summary>
+    /// Начисляет реализованный PnL и комиссию закрытия на урезанный/закрытый фрагмент ноги.
+    /// </summary>
+    private static void AccruedClosedLeg(PositionPair position, IExchangeConnector connector, bool isLong, decimal quantity, decimal exitPrice)
+    {
+        if (quantity <= 0m)
+        {
+            return;
+        }
+
+        var entry = isLong ? position.EntryLong : position.EntryShort;
+        var pnl = quantity * (isLong ? exitPrice - entry : entry - exitPrice);
+        position.RealizedPnlUsd = (position.RealizedPnlUsd ?? 0m) + pnl;
+        position.FeesExitUsd += quantity * exitPrice * TakerPercent(connector, position.Symbol) / 100m;
+
+        if (isLong)
+        {
+            position.ClosedLongVolume += quantity;
+        }
+        else
+        {
+            position.ClosedShortVolume += quantity;
+        }
+    }
+
+    /// <summary>Taker-комиссия биржи по символу (процентом).</summary>
+    private static decimal TakerPercent(IExchangeConnector connector, string symbol) =>
+        connector.TryGetFees(symbol, out var fees) ? fees.TakerPercent : connector.DefaultFees.TakerPercent;
+
     // ------------------------- закрытие -------------------------
 
+    /// <summary>
+    /// Закрывает каждую ногу по её фактическому объёму (market reduceOnly).
+    /// Если нога не закрылась — позиция остаётся под символом, незакрытая нога
+    /// будет повторена на следующем тике; «голой» экспозиции бот не теряет.
+    /// </summary>
     private async Task CloseAsync(PositionPair position, CloseReason reason, CancellationToken ct)
     {
         var longConnector = registry.Connectors.FirstOrDefault(c => c.Id == position.LongExchangeId);
@@ -503,43 +655,89 @@ public sealed class ArbTradeExecutor(
         if (config.Current.General.NetworkMode == NetworkMode.DryRun)
         {
             // симуляция: закрытие по текущим bid/ask (или по входу, если котировок нет)
-            position.ExitLong = longTicker?.Bid ?? position.EntryLong;
-            position.ExitShort = shortTicker?.Ask ?? position.EntryShort;
+            var simExitLong = longTicker?.Bid ?? position.EntryLong;
+            var simExitShort = shortTicker?.Ask ?? position.EntryShort;
+            position.ExitLong = simExitLong;
+            position.ExitShort = simExitShort;
+            AccruedClosedLeg(position, longConnector, isLong: true, position.LongSize, simExitLong);
+            AccruedClosedLeg(position, shortConnector, isLong: false, position.ShortSize, simExitShort);
+            position.LongClosed = true;
+            position.ShortClosed = true;
         }
         else
         {
-            var closeLong = await longConnector.PlaceOrderAsync(
-                new OrderRequest(position.Symbol, OrderSide.Sell, position.MatchedSize, ReduceOnly: true), ct);
-            if (!closeLong.Success)
+            if (!position.LongClosed)
             {
-                log.Error($"[{longConnector.DisplayName}] закрытие лонга {position.Symbol} не удалось: {closeLong.Error}");
-                return; // позиция остаётся открытой, попробуем на следующем тике
+                if (position.LongSize <= 0m)
+                {
+                    position.LongClosed = true;
+                }
+                else
+                {
+                    var closeLong = await longConnector.PlaceOrderAsync(
+                        new OrderRequest(position.Symbol, OrderSide.Sell, position.LongSize, ReduceOnly: true), ct);
+                    if (!closeLong.Success)
+                    {
+                        log.Error($"[{longConnector.DisplayName}] закрытие лонга {position.Symbol} не удалось: {closeLong.Error} — повторю на следующем тике");
+                        return; // позиция остаётся в учёте, закроем позже
+                    }
+
+                    var exitLong = closeLong.AveragePrice ?? longTicker?.Bid ?? position.EntryLong;
+                    var closedQty = closeLong.FilledAmount > 0m ? Math.Min(closeLong.FilledAmount, position.LongSize) : position.LongSize;
+                    AccruedClosedLeg(position, longConnector, isLong: true, closedQty, exitLong);
+                    position.LongSize = Math.Max(0m, position.LongSize - closedQty);
+                    position.ExitLong = exitLong;
+                    position.LongClosed = position.LongSize <= 0m;
+                    if (!position.LongClosed)
+                    {
+                        log.Warning($"{position.Symbol}: лонг закрыт частично, остаток {Formatting.Volume(position.LongSize)} — добью на следующем тике");
+                    }
+                }
             }
 
-            var closeShort = await shortConnector.PlaceOrderAsync(
-                new OrderRequest(position.Symbol, OrderSide.Buy, position.MatchedSize, ReduceOnly: true), ct);
-            if (!closeShort.Success)
+            if (!position.ShortClosed)
             {
-                log.Error($"[{shortConnector.DisplayName}] закрытие шорта {position.Symbol} не удалось: {closeShort.Error}");
-                position.Status = PositionStatus.Open; // лонг закрыт — шорт остался «голым»
-                log.Warning($"[{position.Symbol}] шорт остался без пары — требует ручного внимания!");
-                return;
+                if (position.ShortSize <= 0m)
+                {
+                    position.ShortClosed = true;
+                }
+                else
+                {
+                    var closeShort = await shortConnector.PlaceOrderAsync(
+                        new OrderRequest(position.Symbol, OrderSide.Buy, position.ShortSize, ReduceOnly: true), ct);
+                    if (!closeShort.Success)
+                    {
+                        // лонг уже закрыт — шорт остаётся голым, но позиция не теряется:
+                        // цикл ведения повторит закрытие на каждом следующем тике
+                        log.Error($"[{shortConnector.DisplayName}] закрытие шорта {position.Symbol} не удалось: {closeShort.Error} — позиция остаётся в учёте, повторю на следующем тике");
+                        return;
+                    }
+
+                    var exitShort = closeShort.AveragePrice ?? shortTicker?.Ask ?? position.EntryShort;
+                    var closedQty = closeShort.FilledAmount > 0m ? Math.Min(closeShort.FilledAmount, position.ShortSize) : position.ShortSize;
+                    AccruedClosedLeg(position, shortConnector, isLong: false, closedQty, exitShort);
+                    position.ShortSize = Math.Max(0m, position.ShortSize - closedQty);
+                    position.ExitShort = exitShort;
+                    position.ShortClosed = position.ShortSize <= 0m;
+                    if (!position.ShortClosed)
+                    {
+                        log.Warning($"{position.Symbol}: шорт закрыт частично, остаток {Formatting.Volume(position.ShortSize)} — добью на следующем тике");
+                    }
+                }
             }
 
-            position.ExitLong = closeLong.AveragePrice ?? longTicker?.Bid;
-            position.ExitShort = closeShort.AveragePrice ?? shortTicker?.Ask;
+            if (!position.LongClosed || !position.ShortClosed)
+            {
+                return; // одна нога ещё жива — финализируем, когда закроются обе
+            }
         }
 
-        var exitLong = position.ExitLong ?? position.EntryLong;
-        var exitShort = position.ExitShort ?? position.EntryShort;
-        position.FeesExitUsd = EstimateFees(longConnector, shortConnector, position.Symbol, exitLong, exitShort, position.MatchedSize);
         position.Reason = reason;
         position.ClosedAt = time.GetUtcNow();
         position.Status = PositionStatus.Closed;
 
-        // лонг: (exit − entry); шорт: (entry − exit); минус комиссии обеих сторон
-        position.RealizedPnlUsd = position.MatchedSize * ((exitLong - position.EntryLong) + (position.EntryShort - exitShort))
-                                  - position.FeesEntryUsd - position.FeesExitUsd;
+        // накопленный по ногам PnL минус комиссии входа и выхода
+        position.RealizedPnlUsd = (position.RealizedPnlUsd ?? 0m) - position.FeesEntryUsd - position.FeesExitUsd;
 
         lock (_positions)
         {
@@ -593,11 +791,7 @@ public sealed class ArbTradeExecutor(
     }
 
     private static decimal EstimateFees(IExchangeConnector longConnector, IExchangeConnector shortConnector, string symbol, decimal longPrice, decimal shortPrice, decimal size)
-    {
-        var longFees = longConnector.TryGetFees(symbol, out var lf) ? lf.TakerPercent : longConnector.DefaultFees.TakerPercent;
-        var shortFees = shortConnector.TryGetFees(symbol, out var sf) ? sf.TakerPercent : shortConnector.DefaultFees.TakerPercent;
-        return size * (longPrice * longFees + shortPrice * shortFees) / 100m;
-    }
+        => size * (longPrice * TakerPercent(longConnector, symbol) + shortPrice * TakerPercent(shortConnector, symbol)) / 100m;
 
     private Dictionary<string, int> CountPerExchange()
     {

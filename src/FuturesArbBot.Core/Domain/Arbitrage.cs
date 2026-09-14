@@ -42,6 +42,15 @@ public sealed class PositionPair
     /// <summary>Перекос ног: положителен — больше лонг, отрицателен — больше шорт.</summary>
     public decimal Imbalance => LongSize - ShortSize;
 
+    /// <summary>Суммарно закрыто (закрытыми ногами/урезано) по лонгу за время жизни позиции.</summary>
+    public decimal ClosedLongVolume { get; set; }
+
+    /// <summary>Суммарно закрыто (закрытыми ногами/урезано) по шорту за время жизни позиции.</summary>
+    public decimal ClosedShortVolume { get; set; }
+
+    /// <summary>Закрытый встречный объём позиции — для отчётов после обнуления ног.</summary>
+    public decimal ClosedMatchedVolume => Math.Min(ClosedLongVolume, ClosedShortVolume);
+
     public required decimal EntryLong { get; set; }
 
     public required decimal EntryShort { get; set; }
@@ -51,6 +60,12 @@ public sealed class PositionPair
     public required DateTimeOffset OpenedAt { get; init; }
 
     public PositionStatus Status { get; set; } = PositionStatus.Open;
+
+    /// <summary>Лонговая нога закрыта (промежуточное состояние многошагового закрытия).</summary>
+    public bool LongClosed { get; set; }
+
+    /// <summary>Шортовая нога закрыта (промежуточное состояние многошагового закрытия).</summary>
+    public bool ShortClosed { get; set; }
 
     public decimal? ExitLong { get; set; }
 
