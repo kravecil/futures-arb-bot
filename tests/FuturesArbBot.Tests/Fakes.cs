@@ -62,8 +62,68 @@ public sealed class FakeConnector : IExchangeConnector
     public Task<FetchTickersResult> FetchTickersAsync(CancellationToken ct = default) =>
         Task.FromResult(new FetchTickersResult(Tickers, TimeSpan.FromMilliseconds(12)));
 
-    public Task<OrderResult> PlaceMarketOrderAsync(OrderRequest request, CancellationToken ct = default) =>
-        Task.FromResult(OrderResult.Ok("fake-order-1", null, request.Amount));
+    /// <summary>Все ордера, выставленные через фейк: orderId → запрос.</summary>
+    public Dictionary<string, OrderRequest> PlacedOrders { get; } = new(StringComparer.Ordinal);
+
+    /// <summary>Состояния фейковых ордеров: orderId → снимок (тесты могут менять до опроса).</summary>
+    public Dictionary<string, OrderUpdate> OrderStates { get; } = new(StringComparer.Ordinal);
+
+    /// <summary>Переопределение поведения размещения: вернуть Fail/Ok — тестовая проводка сбоев.</summary>
+    public Func<OrderRequest, int, OrderResult>? PlaceOrderOverride { get; set; }
+
+    /// <summary>Если true — фейковый limit исполняется «наполовину» при первом опросе статуса.</summary>
+    public bool LimitPartiallyFills { get; set; }
+
+    private int _orderCounter;
+
+    public Task<OrderResult> PlaceOrderAsync(OrderRequest request, CancellationToken ct = default)
+    {
+        var index = Interlocked.Increment(ref _orderCounter);
+        PlacedOrders[$"fake-order-{index}"] = request;
+
+        var result = PlaceOrderOverride?.Invoke(request, index)
+                     ?? OrderResult.Ok($"fake-order-{index}", request.Price, request.Amount);
+
+        if (result.Success && result.OrderId is not null)
+        {
+            var fullyFilled = result.FilledAmount >= request.Amount;
+            OrderStates[result.OrderId] = new OrderUpdate(
+                result.OrderId,
+                fullyFilled ? OrderStatus.Filled : OrderStatus.Open,
+                result.FilledAmount,
+                result.AveragePrice);
+        }
+
+        return Task.FromResult(result);
+    }
+
+    public Task<OrderUpdate?> FetchOrderAsync(string orderId, string symbol, CancellationToken ct = default)
+    {
+        if (!OrderStates.TryGetValue(orderId, out var state))
+        {
+            return Task.FromResult<OrderUpdate?>(null);
+        }
+
+        if (state.Status == OrderStatus.Open && LimitPartiallyFills && PlacedOrders.TryGetValue(orderId, out var request))
+        {
+            var half = request.Amount / 2m;
+            state = new OrderUpdate(orderId, OrderStatus.Open, half, request.Price);
+            OrderStates[orderId] = state;
+        }
+
+        return Task.FromResult<OrderUpdate?>(state);
+    }
+
+    public Task<bool> CancelOrderAsync(string orderId, string symbol, CancellationToken ct = default)
+    {
+        if (!OrderStates.TryGetValue(orderId, out var state) || state.Status != OrderStatus.Open)
+        {
+            return Task.FromResult(false);
+        }
+
+        OrderStates[orderId] = state with { Status = OrderStatus.Canceled };
+        return Task.FromResult(true);
+    }
 
     public Task SetLeverageAsync(int leverage, string symbol, CancellationToken ct = default) => Task.CompletedTask;
 

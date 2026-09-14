@@ -182,19 +182,19 @@ public sealed class ArbTradeExecutor(
         await longConnector.SetLeverageAsync(options.Leverage, estimate.Symbol, ct);
         await shortConnector.SetLeverageAsync(options.Leverage, estimate.Symbol, ct);
 
-        var buy = await longConnector.PlaceMarketOrderAsync(new OrderRequest(estimate.Symbol, OrderSide.Buy, amount.Value), ct);
+        var buy = await longConnector.PlaceOrderAsync(new OrderRequest(estimate.Symbol, OrderSide.Buy, amount.Value), ct);
         if (!buy.Success)
         {
             stats.RecordOpenFailed(estimate.Symbol, buy.Error ?? "неизвестная ошибка");
             return;
         }
 
-        var sell = await shortConnector.PlaceMarketOrderAsync(new OrderRequest(estimate.Symbol, OrderSide.Sell, amount.Value), ct);
+        var sell = await shortConnector.PlaceOrderAsync(new OrderRequest(estimate.Symbol, OrderSide.Sell, amount.Value), ct);
         if (!sell.Success)
         {
             // вторая нога не прошла — срочно закатываем первую (reduceOnly)
             log.Error($"[{shortConnector.DisplayName}] шорт не открылся ({sell.Error}); откатываю лонг");
-            await longConnector.PlaceMarketOrderAsync(new OrderRequest(estimate.Symbol, OrderSide.Sell, amount.Value, ReduceOnly: true), CancellationToken.None);
+            await longConnector.PlaceOrderAsync(new OrderRequest(estimate.Symbol, OrderSide.Sell, amount.Value, ReduceOnly: true), CancellationToken.None);
             stats.RecordOpenFailed(estimate.Symbol, $"шорт не открыт: {sell.Error}");
             return;
         }
@@ -276,7 +276,7 @@ public sealed class ArbTradeExecutor(
         }
         else
         {
-            var closeLong = await longConnector.PlaceMarketOrderAsync(
+            var closeLong = await longConnector.PlaceOrderAsync(
                 new OrderRequest(position.Symbol, OrderSide.Sell, position.MatchedSize, ReduceOnly: true), ct);
             if (!closeLong.Success)
             {
@@ -284,7 +284,7 @@ public sealed class ArbTradeExecutor(
                 return; // позиция остаётся открытой, попробуем на следующем тике
             }
 
-            var closeShort = await shortConnector.PlaceMarketOrderAsync(
+            var closeShort = await shortConnector.PlaceOrderAsync(
                 new OrderRequest(position.Symbol, OrderSide.Buy, position.MatchedSize, ReduceOnly: true), ct);
             if (!closeShort.Success)
             {

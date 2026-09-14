@@ -30,6 +30,42 @@ public sealed record TickerSnapshot(
     public bool IsTradable => Bid > 0m && Ask > 0m;
 }
 
+/// <summary>Жизненный статус ордера на бирже.</summary>
+public enum OrderStatus
+{
+    /// <summary>Ордер активен (в стакане или ожидает исполнения).</summary>
+    Open,
+
+    /// <summary>Полностью исполнен.</summary>
+    Filled,
+
+    /// <summary>Отменён.</summary>
+    Canceled,
+
+    /// <summary>Срок действия истёк.</summary>
+    Expired,
+
+    /// <summary>Отклонён биржей.</summary>
+    Rejected,
+
+    /// <summary>Статус не распознан — трактовать как «ещё жив».</summary>
+    Unknown,
+}
+
+/// <summary>Снимок состояния ордера для опроса исполнения лимитных заявок.</summary>
+public sealed record OrderUpdate(
+    string OrderId,
+    OrderStatus Status,
+    decimal FilledAmount,
+    decimal? AveragePrice)
+{
+    /// <summary>Ордер больше не может исполниться (отменён/истёк/отклонён).</summary>
+    public bool IsDead => Status is OrderStatus.Canceled or OrderStatus.Expired or OrderStatus.Rejected;
+
+    /// <summary>Ордер полностью исполнен.</summary>
+    public bool IsFilled => Status == OrderStatus.Filled;
+}
+
 /// <summary>Запрос на ордер (рыночный или лимитный). Для лимитного обязана быть задана цена.</summary>
 public sealed record OrderRequest(
     string Symbol,

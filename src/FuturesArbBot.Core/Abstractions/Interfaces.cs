@@ -57,7 +57,14 @@ public interface IExchangeConnector : IAsyncDisposable
 
     Task<FetchTickersResult> FetchTickersAsync(CancellationToken ct = default);
 
-    Task<OrderResult> PlaceMarketOrderAsync(OrderRequest request, CancellationToken ct = default);
+    /// <summary>Выставить ордер (market или limit — по <see cref="OrderRequest.Type"/>).</summary>
+    Task<OrderResult> PlaceOrderAsync(OrderRequest request, CancellationToken ct = default);
+
+    /// <summary>Актуальное состояние ордера; null — ордер не найден.</summary>
+    Task<OrderUpdate?> FetchOrderAsync(string orderId, string symbol, CancellationToken ct = default);
+
+    /// <summary>Отменить ордер. false — отмена не прошла (например, уже исполнен).</summary>
+    Task<bool> CancelOrderAsync(string orderId, string symbol, CancellationToken ct = default);
 
     Task SetLeverageAsync(int leverage, string symbol, CancellationToken ct = default);
 

@@ -217,7 +217,7 @@ public sealed class CcxtExchangeConnector : IExchangeConnector
         return new FetchTickersResult(result, stopwatch.Elapsed);
     }
 
-    public async Task<OrderResult> PlaceMarketOrderAsync(OrderRequest request, CancellationToken ct = default)
+    public async Task<OrderResult> PlaceOrderAsync(OrderRequest request, CancellationToken ct = default)
     {
         try
         {
@@ -236,13 +236,32 @@ public sealed class CcxtExchangeConnector : IExchangeConnector
                 parameters["reduceOnly"] = true;
             }
 
-            var side = request.Side == OrderSide.Buy ? "buy" : "sell";
-            var order = await _api.CreateOrder(request.Symbol, "market", side, amount, null, parameters);
+            double? price = null;
+            var type = "market";
+            if (request.Type == OrderType.Limit)
+            {
+                if (request.Price is not { } limitPrice || limitPrice <= 0m)
+                {
+                    return OrderResult.Fail("для лимитного ордера не задана цена");
+                }
 
-            var filled = order.filled is { } f && f > 0.0 ? (decimal)f : (decimal)amount;
+                type = "limit";
+                price = Convert.ToDouble(_api.priceToPrecision(request.Symbol, (double)limitPrice), CultureInfo.InvariantCulture);
+            }
+
+            var side = request.Side == OrderSide.Buy ? "buy" : "sell";
+            var order = await _api.CreateOrder(request.Symbol, type, side, amount, price, parameters);
+
+            var filled = order.filled is { } f && f > 0.0 ? (decimal)f : 0m;
             decimal? average = order.average is { } a && a > 0.0 ? (decimal)a
                 : order.price is { } p && p > 0.0 ? (decimal)p
                 : null;
+
+            // рыночный обязан исполниться сразу; лимитный мог ещё не набрать объёма
+            if (request.Type == OrderType.Market && order.status is "open" or "rejected" && filled <= 0m)
+            {
+                return OrderResult.Fail($"рыночный ордер не исполнен (статус: {order.status ?? "unknown"})");
+            }
 
             return OrderResult.Ok(order.id, average, filled);
         }
@@ -254,6 +273,55 @@ public sealed class CcxtExchangeConnector : IExchangeConnector
             return OrderResult.Fail(message);
         }
     }
+
+    public async Task<OrderUpdate?> FetchOrderAsync(string orderId, string symbol, CancellationToken ct = default)
+    {
+        try
+        {
+            ct.ThrowIfCancellationRequested();
+            var order = await _api.FetchOrder(orderId, symbol);
+
+            var filled = order.filled is { } f && f > 0.0 ? (decimal)f : 0m;
+            decimal? average = order.average is { } a && a > 0.0 ? (decimal)a : null;
+
+            return new OrderUpdate(orderId, MapStatus(order.status), filled, average);
+        }
+        catch (OrderNotFound)
+        {
+            return null;
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            _logger.LogDebug(ex, "FetchOrder {OrderId} {Symbol} failed", orderId, symbol);
+            // ошибку опроса не считаем смертью ордера: вернём «открыт» с нулевым исполнением
+            return new OrderUpdate(orderId, OrderStatus.Unknown, 0m, null);
+        }
+    }
+
+    public async Task<bool> CancelOrderAsync(string orderId, string symbol, CancellationToken ct = default)
+    {
+        try
+        {
+            ct.ThrowIfCancellationRequested();
+            await _api.CancelOrder(orderId, symbol);
+            return true;
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            _logger.LogDebug(ex, "CancelOrder {OrderId} {Symbol} failed", orderId, symbol);
+            return false;
+        }
+    }
+
+    private static OrderStatus MapStatus(string? status) => status switch
+    {
+        "open" or "pending" or "unfilled" or "partially_filled" or "partially-closed" => OrderStatus.Open,
+        "closed" or "canceled_filled" or "filled" => OrderStatus.Filled,
+        "canceled" => OrderStatus.Canceled,
+        "expired" => OrderStatus.Expired,
+        "rejected" => OrderStatus.Rejected,
+        _ => OrderStatus.Unknown,
+    };
 
     public async Task SetLeverageAsync(int leverage, string symbol, CancellationToken ct = default)
     {
