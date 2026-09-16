@@ -26,6 +26,12 @@ public sealed class AppRunner(
             return 2;
         }
 
+        if (!ValidateExecution(config.Current, out problem))
+        {
+            AnsiConsole.MarkupLine($"[red]Настройки исполнения некорректны:[/] {Markup.Escape(problem)}");
+            return 2;
+        }
+
         Banner.Print(config);
 
         var connectors = await ConnectExchangesAsync(ct);
@@ -36,6 +42,8 @@ public sealed class AppRunner(
         }
 
         registry.Replace(connectors);
+
+        DescribeExecution(connectors);
 
         if (!await CheckTradingAccessAsync(connectors, ct))
         {
@@ -134,6 +142,69 @@ public sealed class AppRunner(
 
     // ------------------------- запуск и остановка -------------------------
 
+    /// <summary>
+    /// Показать, какие заявки реально уйдут на каждую биржу (конфигурация + переопределения
+    /// + возможности биржи). Понижения unsupported-настроек видны сразу при старте,
+    /// а не в момент первой сделки.
+    /// </summary>
+    private void DescribeExecution(IReadOnlyList<IExchangeConnector> connectors)
+    {
+        var options = config.Current.Arbitrage;
+        var entries = config.Current.Exchanges.Items;
+
+        foreach (var connector in connectors)
+        {
+            var entry = entries.FirstOrDefault(e => string.Equals(e.Id, connector.Id, StringComparison.OrdinalIgnoreCase));
+            var caps = ExchangeCapabilityMap.For(connector.Id);
+            var openPolicy = OrderPolicyResolver.ResolveEntry(options.Execution, entry?.Execution, caps);
+            var closePolicy = OrderPolicyResolver.ResolveClose(options.Execution, entry?.Execution, caps);
+
+            AnsiConsole.MarkupLineInterpolated($"[grey]·[/] {Markup.Escape(connector.DisplayName)}: вход — {Describe(openPolicy)}, закрытие — {Describe(closePolicy)}");
+
+            foreach (var note in openPolicy.Notes.Concat(closePolicy.Notes))
+            {
+                AnsiConsole.MarkupLineInterpolated($"[yellow]![/] {Markup.Escape(connector.DisplayName)}: {Markup.Escape(note)}");
+                log.Warning($"[{connector.Id}] {note}");
+            }
+        }
+    }
+
+    /// <summary>Описание политики заявки для строки запуска.</summary>
+    private static string Describe(OrderPolicy policy)
+    {
+        List<string> parts = [];
+
+        if (policy.RequiresPrice && policy.LimitOffsetBps != 0m)
+        {
+            parts.Add($"смещение {policy.LimitOffsetBps} bps");
+        }
+
+        if (policy.Chase is { } chase)
+        {
+            if (policy.ChasesNatively)
+            {
+                var keys = string.Join(", ", policy.ExchangeParams?.Keys ?? []);
+                parts.Insert(0, $"ChaseLimit (нативный chase биржи, параметры: {(keys.Length > 0 ? keys : "—")})");
+            }
+            else
+            {
+                var tail = chase.FallbackToMarket ? "остаток — market" : "без market-добивки";
+                parts.Insert(0, $"ChaseLimit (локальные перестановки: до {chase.MaxSteps} шагов по {chase.StepBps} bps, не дальше {chase.MaxDeviationBps} bps от старта, {tail})");
+            }
+        }
+        else
+        {
+            parts.Insert(0, policy.Type.ToString());
+
+            if (policy.RequiresPrice && policy.TimeInForce != TimeInForce.Gtc)
+            {
+                parts.Insert(1, policy.TimeInForce.ToString());
+            }
+        }
+
+        return string.Join(", ", parts);
+    }
+
     private async Task<List<IExchangeConnector>> ConnectExchangesAsync(CancellationToken ct)
     {
         var entries = config.Current.Exchanges.Items.Where(e => e.Enabled).ToList();
@@ -231,6 +302,24 @@ public sealed class AppRunner(
     {
         var report = stats.Snapshot(time.GetUtcNow());
         services.GetRequiredService<SessionReportPrinter>().Print(report);
+    }
+
+    /// <summary>
+    /// Проверка раздела Execution: ошибки блокируют запуск, предупреждения (в том числе
+    /// понижение неподдерживаемых биржей настроек) выводятся в консоль и в журнал.
+    /// </summary>
+    private bool ValidateExecution(BotOptions options, out string problem)
+    {
+        var report = OrderConfigValidator.Validate(options, factory.SupportedIds);
+        problem = string.Join(" ", report.Errors);
+
+        foreach (var warning in report.Warnings)
+        {
+            AnsiConsole.MarkupLineInterpolated($"[yellow]![/] {Markup.Escape(warning)}");
+            log.Warning(warning);
+        }
+
+        return report.IsValid;
     }
 
     private static bool ValidateOptions(BotOptions options, out string problem)

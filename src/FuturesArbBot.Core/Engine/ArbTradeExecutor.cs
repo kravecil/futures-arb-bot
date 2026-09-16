@@ -17,6 +17,12 @@ public sealed class ArbTradeExecutor(
     private readonly SemaphoreSlim _gate = new(1, 1);
     private readonly Dictionary<string, PositionPair> _positions = new(StringComparer.Ordinal);
 
+    /// <summary>
+    /// Уже показанные пояснения политики исполнения (exchangeId|заметка): понижение
+    /// unsupported-возможности сообщается один раз, а не на каждой сделке.
+    /// </summary>
+    private readonly HashSet<string> _policyNotes = new(StringComparer.Ordinal);
+
     // кеш последних тикеров: exchangeId → symbol → ticker (используется при закрытии на выходе)
     private readonly Dictionary<string, Dictionary<string, TickerSnapshot>> _lastTickers = new(StringComparer.Ordinal);
     private Dictionary<string, Dictionary<string, MarketInfo>>? _marketsCache;
@@ -182,18 +188,59 @@ public sealed class ArbTradeExecutor(
 
     // ------------------------- открытие -------------------------
 
-    /// <summary>Состояние исполнения одной limit-ноги при открытии.</summary>
+    /// <summary>
+    /// Состояние исполнения одной ноги: одна активная заявка плюс накопленный итог
+    /// предыдущих заявок (нужно для догонания цены, когда заявок у ноги несколько).
+    /// </summary>
     private sealed class LegState
     {
         public required IExchangeConnector Connector { get; init; }
 
-        public required OrderRequest Request { get; init; }
+        /// <summary>Текущая (последняя выставленная) заявка ноги — меняется при догонании.</summary>
+        public required OrderRequest Request { get; set; }
+
+        /// <summary>Развёрнутая политика исполнения на бирже этой ноги.</summary>
+        public required OrderPolicy Policy { get; set; }
+
+        /// <summary>Полный объём ноги, который нужно набрать (не меняется при перестановках).</summary>
+        public required decimal TargetAmount { get; init; }
+
+        /// <summary>Цена первой заявки — от неё считается бюджет отклонения догонания.</summary>
+        public required decimal StartPrice { get; init; }
 
         public string? OrderId { get; set; }
 
-        public decimal Filled { get; set; }
+        /// <summary>Цена последней заявки ноги (для смещения следующего шага и оценки исполнений без цены).</summary>
+        public decimal QuotePrice { get; set; }
 
-        public decimal? AveragePrice { get; set; }
+        /// <summary>Суммарное исполнение всех снятых/заменённых заявок ноги.</summary>
+        public decimal FilledBase { get; set; }
+
+        /// <summary>Исполнение текущей заявки.</summary>
+        public decimal CurrentFilled { get; set; }
+
+        /// <summary>Σ (объём × цена) по всем исполнениям ноги — для средней цены входа.</summary>
+        public decimal CostQuote { get; set; }
+
+        /// <summary>Оставшееся количество шагов догонания.</summary>
+        public int StepsLeft { get; set; }
+
+        /// <summary>Полный бюджет шагов догонания (для нумерации шагов и оценки отклонения).</summary>
+        public int StepsTotal { get; set; }
+
+        /// <summary>Догонание завершено (бюджет исчерпан): повторять fallback не нужно.</summary>
+        public bool ChaseFinished { get; set; }
+
+        /// <summary>Момент последней перестановки заявки (для StepIntervalMs).</summary>
+        public DateTimeOffset LastQuoteAt { get; set; }
+
+        /// <summary>Накопленное по ноге исполнение (по всем заявкам).</summary>
+        public decimal Filled => FilledBase + CurrentFilled;
+
+        /// <summary>Средневзвешенная цена исполнения ноги (null — пока ничего не набрано).</summary>
+        public decimal? AveragePrice => Filled > 0m
+            ? Math.Round(CostQuote / Filled, 8, MidpointRounding.AwayFromZero)
+            : null;
 
         public string? Error { get; set; }
 
@@ -226,23 +273,23 @@ public sealed class ArbTradeExecutor(
             return;
         }
 
-        log.Info($"Открываю арбитраж {estimate.Symbol}: limit BUY {Formatting.Volume(amount.Value)} @ {Formatting.Price(estimate.LongLeg.Price)} на {longConnector.DisplayName}, limit SELL @ {Formatting.Price(estimate.ShortLeg.Price)} на {shortConnector.DisplayName} (нетто {Formatting.Pct(estimate.NetPercent)})");
+        // политики ног: конфигурация (глобальная + переопределение биржи) и возможности биржи
+        var longPolicy = ResolvePolicy(longConnector, options, close: false);
+        var shortPolicy = ResolvePolicy(shortConnector, options, close: false);
+        var longPrice = longPolicy.RequiresPrice ? OffsetPrice(estimate.LongLeg.Price, OrderSide.Buy, longPolicy.LimitOffsetBps) : estimate.LongLeg.Price;
+        var shortPrice = shortPolicy.RequiresPrice ? OffsetPrice(estimate.ShortLeg.Price, OrderSide.Sell, shortPolicy.LimitOffsetBps) : estimate.ShortLeg.Price;
+
+        log.Info($"Открываю арбитраж {estimate.Symbol}: {EntryDescription(longPolicy, OrderSide.Buy, longPrice, amount.Value)} на {longConnector.DisplayName}, " +
+                 $"{EntryDescription(shortPolicy, OrderSide.Sell, shortPrice, amount.Value)} на {shortConnector.DisplayName} (нетто {Formatting.Pct(estimate.NetPercent)})");
 
         await longConnector.SetLeverageAsync(options.Leverage, estimate.Symbol, ct);
         await shortConnector.SetLeverageAsync(options.Leverage, estimate.Symbol, ct);
 
-        // Marketable limit: покупка по ask дешёвой биржи, продажа по bid дорогой —
+        // По умолчанию это marketable limit: покупка по ask дешёвой биржи, продажа по bid дорогой —
         // исполнение сразу при наличии ликвидности, но не хуже указанной цены.
-        LegState longLeg = new()
-        {
-            Connector = longConnector,
-            Request = new OrderRequest(estimate.Symbol, OrderSide.Buy, amount.Value, Type: OrderType.Limit, Price: estimate.LongLeg.Price),
-        };
-        LegState shortLeg = new()
-        {
-            Connector = shortConnector,
-            Request = new OrderRequest(estimate.Symbol, OrderSide.Sell, amount.Value, Type: OrderType.Limit, Price: estimate.ShortLeg.Price),
-        };
+        // Тип заявки, смещение цены и догонание задаёт раздел Execution (OrderPolicyResolver).
+        LegState longLeg = BuildLeg(longConnector, longPolicy, estimate.Symbol, OrderSide.Buy, estimate.LongLeg.Price, amount.Value);
+        LegState shortLeg = BuildLeg(shortConnector, shortPolicy, estimate.Symbol, OrderSide.Sell, estimate.ShortLeg.Price, amount.Value);
         LegState[] legs = [longLeg, shortLeg];
 
         // 1) выставляем ноги последовательно: отказ первой — вторая не выставляется вообще
@@ -250,7 +297,7 @@ public sealed class ArbTradeExecutor(
         {
             if (!await PlaceAsync(leg, ct))
             {
-                var failReason = $"limit {leg.Request.Side} на {leg.Connector.DisplayName} отклонён: {leg.Error}";
+                var failReason = $"{DescribeLeg(leg.Policy.Type, leg.Request.Side)} на {leg.Connector.DisplayName} отклонён: {leg.Error}";
                 log.Error($"{estimate.Symbol}: {failReason}; вторая нога не выставляется");
                 var (residualLong, residualShort) = await AbortLegsAsync(legs, ct);
                 stats.RecordOpenFailed(estimate.Symbol, failReason);
@@ -291,7 +338,7 @@ public sealed class ArbTradeExecutor(
         RegisterPosition(estimate, longLeg, shortLeg);
     }
 
-    /// <summary>Выставить limit-ордер ноги. false — биржа отказала (нога мертва).</summary>
+    /// <summary>Выставить заявку ноги. false — биржа отказала (нога мертва).</summary>
     private async Task<bool> PlaceAsync(LegState leg, CancellationToken ct)
     {
         var result = await leg.Connector.PlaceOrderAsync(leg.Request, ct);
@@ -299,18 +346,46 @@ public sealed class ArbTradeExecutor(
         {
             leg.Error = result.Error ?? "ордер отклонён";
             leg.Dead = true;
-            log.Error($"[{leg.Connector.DisplayName}] limit {leg.Request.Side} {leg.Request.Symbol} не выставлен: {leg.Error}");
+            log.Error($"[{leg.Connector.DisplayName}] {DescribeLeg(leg.Policy.Type, leg.Request.Side)} {leg.Request.Symbol} не выставлен: {leg.Error}");
             return false;
         }
 
         leg.OrderId = result.OrderId;
-        leg.Filled = result.FilledAmount;
-        leg.AveragePrice = result.AveragePrice;
-        leg.Done = leg.Filled >= leg.Request.Amount;
+        RecordFill(leg, result.FilledAmount, result.AveragePrice);
+        leg.Done = leg.Filled >= leg.TargetAmount;
         return true;
     }
 
-    /// <summary>Опрашивает ноги до полного исполнения, смерти заявки или истечения таймаута.</summary>
+    /// <summary>
+    /// Учитывает исполнение текущей заявки ноги: прирост объёма идёт в накопленный итог,
+    /// цена — в средневзвешенную цену входа (без цены биржи берётся цена самой заявки).
+    /// </summary>
+    private static void RecordFill(LegState leg, decimal currentOrderFilled, decimal? price)
+    {
+        var delta = currentOrderFilled - leg.CurrentFilled;
+        if (delta <= 0m)
+        {
+            leg.CurrentFilled = Math.Max(leg.CurrentFilled, currentOrderFilled);
+            return;
+        }
+
+        leg.CurrentFilled += delta;
+        leg.CostQuote += delta * (price ?? leg.QuotePrice);
+    }
+
+    /// <summary>Переносит исполнение снятой/заменённой заявки в накопленный итог ноги.</summary>
+    private static void FoldCurrentFill(LegState leg)
+    {
+        leg.FilledBase += leg.CurrentFilled;
+        leg.CurrentFilled = 0m;
+    }
+
+    /// <summary>
+    /// Опрашивает ноги до полного исполнения, смерти заявки или истечения таймаута.
+    /// Если политике ноги положено локальное догонание цены (Execution:Type = ChaseLimit,
+    /// Chase:Mode = Simulated), неисполненная заявка снимается и переставляется ближе к рынку
+    /// в пределах бюджета шагов и отклонения.
+    /// </summary>
     private async Task WaitForLegsAsync(LegState[] legs, ArbitrageOptions options, CancellationToken ct)
     {
         var deadline = time.GetUtcNow() + TimeSpan.FromMilliseconds(options.OrderExecutionTimeoutMs);
@@ -338,8 +413,7 @@ public sealed class ArbTradeExecutor(
                     continue;
                 }
 
-                leg.Filled = Math.Max(leg.Filled, update.FilledAmount);
-                leg.AveragePrice = update.AveragePrice ?? leg.AveragePrice;
+                RecordFill(leg, update.FilledAmount, update.AveragePrice);
                 if (update.IsFilled)
                 {
                     leg.Done = true;
@@ -348,13 +422,26 @@ public sealed class ArbTradeExecutor(
                 {
                     leg.Dead = true;
                 }
+                else if (leg.Filled >= leg.TargetAmount)
+                {
+                    // объём добран (возможен перелив) — снимаем живую заявку, чтобы не набрать лишнего
+                    leg.Done = true;
+                    if (!update.IsFilled && !update.IsDead && leg.OrderId is not null)
+                    {
+                        await leg.Connector.CancelOrderAsync(leg.OrderId, leg.Request.Symbol, CancellationToken.None);
+                    }
+                }
+                else
+                {
+                    await ChaseStepAsync(leg, ct);
+                }
             }
 
             if (time.GetUtcNow() >= deadline)
             {
                 foreach (var leg in legs.Where(l => !l.Done && !l.Dead))
                 {
-                    leg.Error = $"не исполнена за {options.OrderExecutionTimeoutMs} мс, набрано {Formatting.Volume(leg.Filled)}";
+                    leg.Error ??= $"не исполнена за {options.OrderExecutionTimeoutMs} мс, набрано {Formatting.Volume(leg.Filled)}";
                 }
 
                 break;
@@ -363,6 +450,151 @@ public sealed class ArbTradeExecutor(
             await Task.Delay(options.OrderPollIntervalMs, ct);
         }
     }
+
+    // ------------------------- догонание цены -------------------------
+
+    /// <summary>
+    /// Один такт локального догонания цены: переставить заявку по следующему шагу,
+    /// а когда бюджет (MaxSteps либо MaxDeviationBps) исчерпан — добить остаток
+    /// market-заявкой (FallbackToMarket) либо остановиться и позволить стандартному
+    /// откату снять заявку и зафиксировать набранное.
+    /// </summary>
+    private async Task ChaseStepAsync(LegState leg, CancellationToken ct)
+    {
+        // нативный chase: догоняет биржа, локальных перестановок нет; догонание выключено — тоже нет
+        if (!leg.Policy.ChasesLocally || leg.ChaseFinished || leg.Policy.Chase is not { } chase)
+        {
+            return;
+        }
+
+        if (leg.StepsLeft <= 0 || !HasChaseBudget(leg, chase))
+        {
+            leg.ChaseFinished = true;
+            if (chase.FallbackToMarket)
+            {
+                await FillRemainderByMarketAsync(leg, ct);
+            }
+            else
+            {
+                leg.Error = $"догонание исчерпано ({chase.MaxSteps} шагов по {chase.StepBps} bps), набрано {Formatting.Volume(leg.Filled)}";
+                log.Warning($"[{leg.Connector.DisplayName}] {leg.Request.Symbol} {leg.Request.Side}: {leg.Error}");
+            }
+
+            return;
+        }
+
+        if (time.GetUtcNow() - leg.LastQuoteAt < TimeSpan.FromMilliseconds(chase.StepIntervalMs))
+        {
+            return; // ещё не время переставлять заявку
+        }
+
+        await RequoteAsync(leg, ChasePrice(leg, chase), ct);
+    }
+
+    /// <summary>Снять текущую заявку ноги и переставить неисполненный остаток по новой цене.</summary>
+    private async Task RequoteAsync(LegState leg, decimal price, CancellationToken ct)
+    {
+        var symbol = leg.Request.Symbol;
+        var stepNumber = leg.StepsTotal - leg.StepsLeft + 1;
+
+        if (leg.OrderId is not null)
+        {
+            // отмена идёт вне ct: снять заявку важнее, чем выйти из процесса
+            await leg.Connector.CancelOrderAsync(leg.OrderId, symbol, CancellationToken.None);
+            var final = await leg.Connector.FetchOrderAsync(leg.OrderId, symbol, CancellationToken.None);
+            if (final is not null)
+            {
+                RecordFill(leg, final.FilledAmount, final.AveragePrice);
+            }
+
+            if (final is { IsDead: false, IsFilled: false })
+            {
+                // заявку снять не удалось — не дублируем её, попробуем на следующем тике
+                log.Warning($"[{leg.Connector.DisplayName}] {symbol} {leg.Request.Side}: заявка {leg.OrderId} не снята — догонание откладывается");
+                return;
+            }
+
+            FoldCurrentFill(leg);
+        }
+
+        var remaining = leg.TargetAmount - leg.Filled;
+        if (remaining <= 0m)
+        {
+            leg.Done = true;
+            return;
+        }
+
+        leg.StepsLeft--;
+        leg.LastQuoteAt = time.GetUtcNow();
+        leg.QuotePrice = price;
+        leg.Request = leg.Request with { Amount = remaining, Price = price };
+
+        if (logger.IsEnabled(LogLevel.Debug))
+        {
+            logger.LogDebug(
+                "Chase {Symbol} {Side} on {Exchange}: step {Step}/{Steps} → {Price} (remaining {Remaining})",
+                symbol, leg.Request.Side, leg.Connector.Id, stepNumber, leg.StepsTotal, price, remaining);
+        }
+
+        log.Info($"[{leg.Connector.DisplayName}] догоняю {symbol} {leg.Request.Side}: шаг {stepNumber}/{leg.StepsTotal} по {Formatting.Price(price)}, остаток {Formatting.Volume(remaining)}");
+        await PlaceAsync(leg, ct);
+    }
+
+    /// <summary>Добить неисполненный остаток ноги market-заявкой (Chase:FallbackToMarket).</summary>
+    private async Task FillRemainderByMarketAsync(LegState leg, CancellationToken ct)
+    {
+        var symbol = leg.Request.Symbol;
+
+        if (leg.OrderId is not null && !leg.Dead)
+        {
+            await leg.Connector.CancelOrderAsync(leg.OrderId, symbol, CancellationToken.None);
+            var final = await leg.Connector.FetchOrderAsync(leg.OrderId, symbol, CancellationToken.None);
+            if (final is not null)
+            {
+                RecordFill(leg, final.FilledAmount, final.AveragePrice);
+            }
+
+            if (final is { IsDead: false, IsFilled: false })
+            {
+                log.Warning($"[{leg.Connector.DisplayName}] {symbol} {leg.Request.Side}: заявка {leg.OrderId} не снята — market-добивка откладывается");
+                return;
+            }
+
+            FoldCurrentFill(leg);
+        }
+
+        var remaining = leg.TargetAmount - leg.Filled;
+        if (remaining <= 0m)
+        {
+            leg.Done = true;
+            return;
+        }
+
+        log.Warning($"[{leg.Connector.DisplayName}] {symbol} {leg.Request.Side}: бюджет догонания исчерпан, добиваю {Formatting.Volume(remaining)} market");
+
+        // дальше нога живёт как market: перестановки больше не нужны
+        leg.Policy = leg.Policy with { Type = OrderType.Market, Chase = null };
+        leg.Request = leg.Request with { Amount = remaining, Type = OrderType.Market, Price = null, TimeInForce = TimeInForce.Gtc, ExchangeParams = null };
+        await PlaceAsync(leg, ct);
+    }
+
+    /// <summary>
+    /// Цена следующего шага догонания: смещение от стартовой цены на (сделано шагов + 1) × StepBps
+    /// в сторону агрессии (BUY — вверх, SELL — вниз), но не дальше бюджета MaxDeviationBps.
+    /// </summary>
+    private static decimal ChasePrice(LegState leg, ChasePlan chase)
+    {
+        var bps = Math.Min(NextStepBps(leg, chase), chase.MaxDeviationBps);
+        return OffsetPrice(leg.StartPrice, leg.Request.Side, bps);
+    }
+
+    /// <summary>Отклонение от стартовой цены (bps), которое даст следующий шаг догонания.</summary>
+    private static decimal NextStepBps(LegState leg, ChasePlan chase) =>
+        chase.StepBps * (leg.StepsTotal - leg.StepsLeft + 1);
+
+    /// <summary>Есть ли бюджет отклонения хотя бы ещё на один шаг догонания.</summary>
+    private static bool HasChaseBudget(LegState leg, ChasePlan chase) =>
+        leg.StepsLeft > 0 && NextStepBps(leg, chase) <= chase.MaxDeviationBps;
 
     /// <summary>
     /// Отменяет живые заявки обеих ног и откатывает набранный объём market reduceOnly (с ретраями).
@@ -385,13 +617,14 @@ public sealed class ArbTradeExecutor(
                     var update = await leg.Connector.FetchOrderAsync(leg.OrderId, leg.Request.Symbol, CancellationToken.None);
                     if (update is null || update.IsDead)
                     {
-                        leg.Filled = update?.FilledAmount ?? leg.Filled;
+                        RecordFill(leg, update?.FilledAmount ?? leg.CurrentFilled, update?.AveragePrice);
+                        FoldCurrentFill(leg);
                         leg.Dead = true;
                     }
                     else if (update.IsFilled)
                     {
-                        leg.Filled = update.FilledAmount;
-                        leg.AveragePrice = update.AveragePrice ?? leg.AveragePrice;
+                        RecordFill(leg, update.FilledAmount, update.AveragePrice);
+                        FoldCurrentFill(leg);
                         leg.Done = true;
                     }
                 }
@@ -425,6 +658,97 @@ public sealed class ArbTradeExecutor(
         _ = ct; // откат выполняется по CancellationToken.None: он важнее выхода из процесса
         return (residuals[0], residuals[1]);
     }
+
+    // ------------------------- политика исполнения -------------------------
+
+    /// <summary>
+    /// Развернуть политику исполнения для биржи: глобальный Arbitrage:Execution,
+    /// поверх — переопределение из exchanges.json, поверх — возможности биржи
+    /// (неподдерживаемое понижается с пояснением, которое показывается один раз).
+    /// </summary>
+    private OrderPolicy ResolvePolicy(IExchangeConnector connector, ArbitrageOptions options, bool close)
+    {
+        var entry = config.Current.Exchanges.Items.FirstOrDefault(
+            e => string.Equals(e.Id, connector.Id, StringComparison.OrdinalIgnoreCase));
+        var caps = ExchangeCapabilityMap.For(connector.Id);
+
+        var policy = close
+            ? OrderPolicyResolver.ResolveClose(options.Execution, entry?.Execution, caps)
+            : OrderPolicyResolver.ResolveEntry(options.Execution, entry?.Execution, caps);
+
+        foreach (var note in policy.Notes)
+        {
+            if (_policyNotes.Add($"{connector.Id}|{note}"))
+            {
+                log.Warning($"[{connector.DisplayName}] {note}");
+            }
+        }
+
+        return policy;
+    }
+
+    /// <summary>
+    /// Собрать состояние ноги: цена со смещением LimitOffsetBps от котировки, тип заявки
+    /// (ChaseLimit с локальным догонанием на бирже выглядит как обычный limit) и бюджет шагов.
+    /// </summary>
+    private LegState BuildLeg(IExchangeConnector connector, OrderPolicy policy, string symbol, OrderSide side, decimal referencePrice, decimal amount, bool reduceOnly = false)
+    {
+        var price = policy.RequiresPrice ? OffsetPrice(referencePrice, side, policy.LimitOffsetBps) : (decimal?)null;
+
+        // на биржу уходит то, что она исполняет: локальное догонание — это обычные limit-заявки,
+        // нативный chase остаётся ChaseLimit (коннектор добавит к ним параметры биржи)
+        var requestType = policy.ChasesLocally ? OrderType.Limit : policy.Type;
+
+        return new LegState
+        {
+            Connector = connector,
+            Policy = policy,
+            TargetAmount = amount,
+            StartPrice = price ?? referencePrice,
+            QuotePrice = price ?? referencePrice,
+            Request = new OrderRequest(
+                symbol,
+                side,
+                amount,
+                ReduceOnly: reduceOnly,
+                Type: requestType,
+                Price: price,
+                TimeInForce: policy.TimeInForce,
+                ExchangeParams: policy.ExchangeParams),
+            StepsTotal = policy.ChasesLocally && policy.Chase is { } plan ? plan.MaxSteps : 0,
+            StepsLeft = policy.ChasesLocally && policy.Chase is { } budget ? budget.MaxSteps : 0,
+            LastQuoteAt = time.GetUtcNow(),
+        };
+    }
+
+    /// <summary>
+    /// Цена заявки со смещением от котировки: BUY — выше (агрессивнее, исполняется вероятнее),
+    /// SELL — ниже. Смещение в bps (1 bps = 0.01 %).
+    /// </summary>
+    private static decimal OffsetPrice(decimal reference, OrderSide side, decimal offsetBps)
+    {
+        if (offsetBps == 0m)
+        {
+            return reference;
+        }
+
+        var sign = side == OrderSide.Buy ? 1m : -1m;
+        return Math.Round(reference * (1m + sign * offsetBps / 10_000m), 8, MidpointRounding.AwayFromZero);
+    }
+
+    /// <summary>Человекочитаемое описание заявки ноги для журнала.</summary>
+    private static string DescribeLeg(OrderType type, OrderSide side) => type switch
+    {
+        OrderType.Market => $"MARKET {side}",
+        OrderType.ChaseLimit => $"CHASE-LIMIT {side}",
+        _ => $"LIMIT {side}",
+    };
+
+    /// <summary>Описание заявки ноги с объёмом и ценой для строки журнала.</summary>
+    private static string EntryDescription(OrderPolicy policy, OrderSide side, decimal price, decimal amount) =>
+        policy.RequiresPrice
+            ? $"{DescribeLeg(policy.Type, side)} {Formatting.Volume(amount)} @ {Formatting.Price(price)}"
+            : $"{DescribeLeg(policy.Type, side)} {Formatting.Volume(amount)}";
 
     /// <summary>Регистрирует полностью открытую позицию по факту исполнения обеих ног.</summary>
     private void RegisterPosition(SpreadEstimate estimate, LegState longLeg, LegState shortLeg)
@@ -537,7 +861,9 @@ public sealed class ArbTradeExecutor(
     }
 
     /// <summary>
-    /// Урезает бóльшую ногу reduceOnly limit-ордером по текущему bid/ask до выравнивания ног.
+    /// Урезает бóльшую ногу reduceOnly-заявкой по текущему bid/ask до выравнивания ног.
+    /// Тип заявки, смещение цены и догонание — те же, что для входа (Execution): позиция
+    /// здесь не закрывается, а перебалансировывается, поэтому политика входная.
     /// Частичное исполнение фиксируется; остаток добирается на следующем тике.
     /// </summary>
     private async Task RebalanceAsync(PositionPair position, ArbitrageOptions options, CancellationToken ct)
@@ -559,13 +885,11 @@ public sealed class ArbTradeExecutor(
         }
 
         var side = cutLong ? OrderSide.Sell : OrderSide.Buy;
-        var leg = new LegState
-        {
-            Connector = connector,
-            Request = new OrderRequest(position.Symbol, side, delta, ReduceOnly: true, Type: OrderType.Limit, Price: price),
-        };
+        var policy = ResolvePolicy(connector, options, close: false);
+        var leg = BuildLeg(connector, policy, position.Symbol, side, price, delta, reduceOnly: true);
+        var quote = leg.Request.Price ?? price;
 
-        log.Info($"{position.Symbol}: ребаланс — урезаю {(cutLong ? "лонг" : "шорт")} на {Formatting.Volume(delta)} @ {Formatting.Price(price)} (ноги {Formatting.Volume(position.LongSize)}/{Formatting.Volume(position.ShortSize)})");
+        log.Info($"{position.Symbol}: ребаланс — урезаю {(cutLong ? "лонг" : "шорт")} на {Formatting.Volume(delta)} @ {Formatting.Price(quote)} (ноги {Formatting.Volume(position.LongSize)}/{Formatting.Volume(position.ShortSize)})");
         if (!await PlaceAsync(leg, ct))
         {
             return; // отказ — повторим на следующем тике
@@ -580,8 +904,7 @@ public sealed class ArbTradeExecutor(
             var update = await connector.FetchOrderAsync(leg.OrderId, position.Symbol, CancellationToken.None);
             if (update is not null)
             {
-                leg.Filled = Math.Max(leg.Filled, update.FilledAmount);
-                leg.AveragePrice = update.AveragePrice ?? leg.AveragePrice;
+                RecordFill(leg, update.FilledAmount, update.AveragePrice);
             }
         }
 
@@ -643,12 +966,64 @@ public sealed class ArbTradeExecutor(
     // ------------------------- закрытие -------------------------
 
     /// <summary>
-    /// Закрывает каждую ногу по её фактическому объёму (market reduceOnly).
-    /// Если нога не закрылась — позиция остаётся под символом, незакрытая нога
-    /// будет повторена на следующем тике; «голой» экспозиции бот не теряет.
+    /// Закрыть ногу по политике Execution.Close: market — сразу, limit — заявка с ожиданием
+    /// и снятием остатка по таймауту (остаток закрывается на следующем тике цикла ведения).
+    /// Возвращает (закрытый объём, средняя цена, ошибка); объём 0 — нога не закрыта.
+    /// </summary>
+    private async Task<(decimal Closed, decimal? AveragePrice, string? Error)> CloseLegAsync(
+        PositionPair position, IExchangeConnector connector, bool isLong, decimal size, decimal? reference, ArbitrageOptions options, CancellationToken ct)
+    {
+        var side = isLong ? OrderSide.Sell : OrderSide.Buy;
+        var policy = ResolvePolicy(connector, options, close: true);
+
+        if (policy.RequiresPrice && reference is not > 0m)
+        {
+            // лимитную заявку выставить некуда (нет котировки) — страховка: закрываем market
+            log.Warning($"[{connector.DisplayName}] {position.Symbol}: нет котировки для лимитного закрытия — закрываю market");
+            policy = OrderPolicy.MarketOrder;
+        }
+
+        var leg = BuildLeg(connector, policy, position.Symbol, side, reference ?? 0m, size, reduceOnly: true);
+        if (!await PlaceAsync(leg, ct))
+        {
+            return (0m, null, leg.Error ?? "заявка отклонена");
+        }
+
+        // market-заявку не опрашиваем: она обязана исполниться сразу (как и раньше в закрытии)
+        if (!leg.Done && policy.Type != OrderType.Market)
+        {
+            await WaitForLegsAsync([leg], options, ct);
+
+            if (!leg.Done && !leg.Dead && leg.OrderId is not null)
+            {
+                await connector.CancelOrderAsync(leg.OrderId, position.Symbol, CancellationToken.None);
+                var update = await connector.FetchOrderAsync(leg.OrderId, position.Symbol, CancellationToken.None);
+                if (update is not null)
+                {
+                    RecordFill(leg, update.FilledAmount, update.AveragePrice);
+                }
+            }
+        }
+
+        var closed = Math.Min(leg.Filled, size);
+        if (closed <= 0m && policy.Type == OrderType.Market)
+        {
+            // рыночная заявка прошла, но биржа не вернула объём: считаем ногу закрытой целиком
+            closed = size;
+        }
+
+        return (closed, leg.AveragePrice, leg.Error);
+    }
+
+    /// <summary>
+    /// Закрывает каждую ногу по её фактическому объёму (по умолчанию — market reduceOnly,
+    /// настраивается разделом Execution:Close). Если нога не закрылась — позиция остаётся
+    /// под символом, незакрытая нога будет повторена на следующем тике; «голой» экспозиции
+    /// бот не теряет.
     /// </summary>
     private async Task CloseAsync(PositionPair position, CloseReason reason, CancellationToken ct)
     {
+        var options = config.Current.Arbitrage;
         var longConnector = registry.Connectors.FirstOrDefault(c => c.Id == position.LongExchangeId);
         var shortConnector = registry.Connectors.FirstOrDefault(c => c.Id == position.ShortExchangeId);
         if (longConnector is null || shortConnector is null)
@@ -681,16 +1056,15 @@ public sealed class ArbTradeExecutor(
                 }
                 else
                 {
-                    var closeLong = await longConnector.PlaceOrderAsync(
-                        new OrderRequest(position.Symbol, OrderSide.Sell, position.LongSize, ReduceOnly: true), ct);
-                    if (!closeLong.Success)
+                    var (closedQty, exitPrice, closeError) = await CloseLegAsync(
+                        position, longConnector, isLong: true, position.LongSize, longTicker?.Bid, options, ct);
+                    if (closedQty <= 0m)
                     {
-                        log.Error($"[{longConnector.DisplayName}] закрытие лонга {position.Symbol} не удалось: {closeLong.Error} — повторю на следующем тике");
+                        log.Error($"[{longConnector.DisplayName}] закрытие лонга {position.Symbol} не удалось: {closeError ?? "заявка не исполнена"} — повторю на следующем тике");
                         return; // позиция остаётся в учёте, закроем позже
                     }
 
-                    var exitLong = closeLong.AveragePrice ?? longTicker?.Bid ?? position.EntryLong;
-                    var closedQty = closeLong.FilledAmount > 0m ? Math.Min(closeLong.FilledAmount, position.LongSize) : position.LongSize;
+                    var exitLong = exitPrice ?? longTicker?.Bid ?? position.EntryLong;
                     AccruedClosedLeg(position, longConnector, isLong: true, closedQty, exitLong);
                     position.LongSize = Math.Max(0m, position.LongSize - closedQty);
                     position.ExitLong = exitLong;
@@ -710,18 +1084,17 @@ public sealed class ArbTradeExecutor(
                 }
                 else
                 {
-                    var closeShort = await shortConnector.PlaceOrderAsync(
-                        new OrderRequest(position.Symbol, OrderSide.Buy, position.ShortSize, ReduceOnly: true), ct);
-                    if (!closeShort.Success)
+                    var (closedQty, exitPrice, closeError) = await CloseLegAsync(
+                        position, shortConnector, isLong: false, position.ShortSize, shortTicker?.Ask, options, ct);
+                    if (closedQty <= 0m)
                     {
                         // лонг уже закрыт — шорт остаётся голым, но позиция не теряется:
                         // цикл ведения повторит закрытие на каждом следующем тике
-                        log.Error($"[{shortConnector.DisplayName}] закрытие шорта {position.Symbol} не удалось: {closeShort.Error} — позиция остаётся в учёте, повторю на следующем тике");
+                        log.Error($"[{shortConnector.DisplayName}] закрытие шорта {position.Symbol} не удалось: {closeError ?? "заявка не исполнена"} — позиция остаётся в учёте, повторю на следующем тике");
                         return;
                     }
 
-                    var exitShort = closeShort.AveragePrice ?? shortTicker?.Ask ?? position.EntryShort;
-                    var closedQty = closeShort.FilledAmount > 0m ? Math.Min(closeShort.FilledAmount, position.ShortSize) : position.ShortSize;
+                    var exitShort = exitPrice ?? shortTicker?.Ask ?? position.EntryShort;
                     AccruedClosedLeg(position, shortConnector, isLong: false, closedQty, exitShort);
                     position.ShortSize = Math.Max(0m, position.ShortSize - closedQty);
                     position.ExitShort = exitShort;

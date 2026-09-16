@@ -114,6 +114,13 @@ public sealed class ArbitrageOptions
     [Range(50, 10_000)]
     public int OrderPollIntervalMs { get; set; } = 200;
 
+    /// <summary>
+    /// Политика исполнения заявок (тип ордера, смещение цены, догонание).
+    /// Необязательный раздел: пустые поля означают «как раньше» —
+    /// marketable limit для входа, market для закрытия.
+    /// </summary>
+    public OrderExecutionOptions Execution { get; set; } = new();
+
     /// <summary>Номинал одного арбитража в USDT (на каждую ногу).</summary>
     [Range(1, 10_000_000)]
     public decimal OrderSizeUsd { get; set; } = 100m;
@@ -202,4 +209,80 @@ public sealed class ExchangeConfigEntry
 
     /// <summary>Дополнительные опции CCXT для конкретной биржи.</summary>
     public Dictionary<string, object>? Options { get; set; }
+
+    /// <summary>
+    /// Переопределение политики исполнения для этой биржи (поверх Arbitrage.Execution).
+    /// Задаются только отличающиеся поля; остальное наследуется из глобального раздела.
+    /// </summary>
+    public OrderExecutionOptions? Execution { get; set; }
+}
+
+/// <summary>
+/// Настройки исполнения одной заявки (appsettings.json → Arbitrage.Execution,
+/// либо переопределение в exchanges.json → Exchanges:Items:n:Execution).
+/// Любое поле может быть отсутствовать — тогда применяется значение по умолчанию
+/// (или значение из глобального раздела, если это переопределение на бирже).
+/// </summary>
+public sealed class OrderExecutionOptions
+{
+    /// <summary>Market | Limit | ChaseLimit. По умолчанию: Limit на входе, Market на закрытии.</summary>
+    [EnumDataType(typeof(OrderType))]
+    public OrderType? Type { get; set; }
+
+    /// <summary>
+    /// Смещение лимитной цены от котировки в bps (1 bps = 0.01 %):
+    /// BUY — выше (агрессивнее, быстрее исполняется), SELL — ниже.
+    /// </summary>
+    [Range(-1000, 1000)]
+    public decimal? LimitOffsetBps { get; set; }
+
+    /// <summary>Gtc | Ioc | Fok | PostOnly. По умолчанию Gtc (заявка живёт в стакане).</summary>
+    [EnumDataType(typeof(TimeInForce))]
+    public TimeInForce? TimeInForce { get; set; }
+
+    /// <summary>Параметры догонания цены (используются только при Type = ChaseLimit).</summary>
+    public ChaseOptions? Chase { get; set; }
+
+    /// <summary>
+    /// Отдельная политика закрытия ног. По умолчанию — market (надёжнее:
+    /// выход должен состояться немедленно, а не «когда биржа соизволит дать цену»).
+    /// Догонание (Chase) на закрытии не допускается.
+    /// </summary>
+    public OrderExecutionOptions? Close { get; set; }
+}
+
+/// <summary>Настройки догонания цены лимитной заявки (Execution:Chase).</summary>
+public sealed class ChaseOptions
+{
+    /// <summary>None | Simulated (заявку переставляет робот) | Native (chase-ордер биржи).</summary>
+    [EnumDataType(typeof(ChaseMode))]
+    public ChaseMode? Mode { get; set; }
+
+    /// <summary>Сколько раз переставить заявку, прежде чем сдаться.</summary>
+    [Range(1, 100)]
+    public int? MaxSteps { get; set; }
+
+    /// <summary>Пауза между перестановками заявки, мс.</summary>
+    [Range(50, 60_000)]
+    public int? StepIntervalMs { get; set; }
+
+    /// <summary>Шаг смещения цены к рынку, bps.</summary>
+    [Range(0, 1000)]
+    public decimal? StepBps { get; set; }
+
+    /// <summary>Бюджет отклонения от стартовой цены, bps. Сверх него заявка не догоняется.</summary>
+    [Range(0, 10_000)]
+    public decimal? MaxDeviationBps { get; set; }
+
+    /// <summary>
+    /// Добить неисполненный остаток market-ордером, когда бюджет догонания исчерпан.
+    /// false — остаток отменяется и набранное откатывается (как без chase).
+    /// </summary>
+    public bool? FallbackToMarket { get; set; }
+
+    /// <summary>
+    /// Нативные параметры биржи для Mode = Native (имена — те, что ждёт CCXT в params).
+    /// Пример для KuCoin Futures: { "chaseType": "priceChase" }. Требует проверки на testnet.
+    /// </summary>
+    public Dictionary<string, string>? Params { get; set; }
 }

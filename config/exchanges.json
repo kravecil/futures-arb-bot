@@ -1,5 +1,5 @@
 {
-  "_comment": "Список бирж. Id — идентификаторы CCXT. Включайте/отключайте поля Enabled. API-ключи нужны только для торговли (Testnet/Live); для мониторинга спредов достаточно пустых. Ключи можно задавать через переменные окружения: ARB_BYBIT_API_KEY, ARB_BYBIT_SECRET, ARB_OKX_PASSWORD и т.д.",
+  "_comment": "Список бирж. Id — идентификаторы CCXT. Включайте/отключайте поля Enabled. API-ключи нужны только для торговли (Testnet/Live); для мониторинга спредов достаточно пустых. Ключи можно задавать через переменные окружения: ARB_BYBIT_API_KEY, ARB_BYBIT_SECRET, ARB_OKX_PASSWORD и т.д. Необязательное поле Execution у биржи переопределяет Arbitrage:Execution — пример: \"Execution\": { \"LimitOffsetBps\": 15, \"Chase\": { \"MaxSteps\": 2 } }.",
 
   "Exchanges": {
     "Items": [

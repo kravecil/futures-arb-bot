@@ -66,14 +66,20 @@ public sealed record OrderUpdate(
     public bool IsFilled => Status == OrderStatus.Filled;
 }
 
-/// <summary>Запрос на ордер (рыночный или лимитный). Для лимитного обязана быть задана цена.</summary>
+/// <summary>
+/// Запрос на ордер. Для лимитных типов (Limit, ChaseLimit) обязана быть задана цена.
+/// TimeInForce и ExchangeParams заполняются политикой исполнения (<see cref="OrderPolicy"/>)
+/// транслируются в параметры CCXT через <see cref="OrderParamsBuilder"/>.
+/// </summary>
 public sealed record OrderRequest(
     string Symbol,
     OrderSide Side,
     decimal Amount,
     bool ReduceOnly = false,
     OrderType Type = OrderType.Market,
-    decimal? Price = null);
+    decimal? Price = null,
+    TimeInForce TimeInForce = TimeInForce.Gtc,
+    IReadOnlyDictionary<string, string>? ExchangeParams = null);
 
 /// <summary>Результат исполнения ордера.</summary>
 public sealed record OrderResult

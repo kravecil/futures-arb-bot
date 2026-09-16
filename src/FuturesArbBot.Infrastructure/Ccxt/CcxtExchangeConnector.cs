@@ -230,22 +230,20 @@ public sealed class CcxtExchangeConnector : IExchangeConnector
                 return OrderResult.Fail($"объём после округления равен нулю ({request.Amount})");
             }
 
-            Dictionary<string, object> parameters = [];
-            if (request.ReduceOnly)
-            {
-                parameters["reduceOnly"] = true;
-            }
+            // имена и условия параметров биржи (перевод политики заявки) — в OrderParamsBuilder
+            var parameters = OrderParamsBuilder.Build(request, ExchangeCapabilityMap.For(Id));
 
             double? price = null;
-            var type = "market";
-            if (request.Type == OrderType.Limit)
+            // ChaseLimit на бирже — это limit: локальное догонание делает исполнитель,
+            // нативное — сама биржа через параметры из request.ExchangeParams.
+            var type = request.Type == OrderType.Market ? "market" : "limit";
+            if (request.Type != OrderType.Market)
             {
                 if (request.Price is not { } limitPrice || limitPrice <= 0m)
                 {
                     return OrderResult.Fail("для лимитного ордера не задана цена");
                 }
 
-                type = "limit";
                 price = Convert.ToDouble(_api.priceToPrecision(request.Symbol, (double)limitPrice), CultureInfo.InvariantCulture);
             }
 
