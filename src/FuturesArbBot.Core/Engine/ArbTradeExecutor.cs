@@ -23,6 +23,24 @@ public sealed class ArbTradeExecutor(
     /// </summary>
     private readonly HashSet<string> _policyNotes = new(StringComparer.Ordinal);
 
+    /// <summary>
+    /// Экспозиция бирж вне учёта сеанса (результат сверки <see cref="ReconcileExternalExposureAsync"/>):
+    /// exchangeId → символы с ненулевой позицией. Лимиты MaxOpenPositions/MaxPositionsPerExchange
+    /// считаются вместе с ней — иначе после рестарта бот открывал «ещё одну» поверх забытой на бирже.
+    /// </summary>
+    private readonly Dictionary<string, HashSet<string>> _externalExposure = new(StringComparer.Ordinal);
+
+    /// <summary>Заявки, не снятые при откате открытия: цикл ведения продолжит их отменять каждый тик.</summary>
+    private readonly List<StrayOrder> _strayOrders = [];
+
+    /// <summary>Биржи, о сбое сверки на которых уже сообщали (не спамить в журнал каждый тик).</summary>
+    private readonly HashSet<string> _reconcileFailWarned = new(StringComparer.Ordinal);
+
+    private DateTimeOffset _lastReconcileAt;
+
+    /// <summary>Период сверки фактической экспозиции с биржами (fetchPositions — приватный запрос).</summary>
+    private static readonly TimeSpan ReconcileInterval = TimeSpan.FromSeconds(60);
+
     // кеш последних тикеров: exchangeId → symbol → ticker (используется при закрытии на выходе)
     private readonly Dictionary<string, Dictionary<string, TickerSnapshot>> _lastTickers = new(StringComparer.Ordinal);
     private Dictionary<string, Dictionary<string, MarketInfo>>? _marketsCache;
@@ -49,8 +67,13 @@ public sealed class ArbTradeExecutor(
         try
         {
             var options = config.Current.Arbitrage;
+
+            // лимиты обязаны считать фактическую экспозицию бирж, а не только память сеанса
+            await ReconcileExternalExposureAsync(ct);
+
             foreach (var candidate in candidates)
             {
+                var externalArbitrages = CountExternalArbitrages();
                 lock (_positions)
                 {
                     if (_positions.ContainsKey(candidate.Symbol))
@@ -58,9 +81,9 @@ public sealed class ArbTradeExecutor(
                         continue; // на символ — одна арбитражная позиция
                     }
 
-                    if (_positions.Count >= options.MaxOpenPositions)
+                    if (_positions.Count + externalArbitrages >= options.MaxOpenPositions)
                     {
-                        return; // лимит позиций исчерпан
+                        return; // лимит сеансовых и найденных на биржах арбитражей исчерпан
                     }
                 }
 
@@ -83,6 +106,10 @@ public sealed class ArbTradeExecutor(
     public async Task ManageOpenPositionsAsync(IReadOnlyDictionary<string, IReadOnlyDictionary<string, TickerSnapshot>> tickersByExchange, CancellationToken ct)
     {
         UpdateTickerCache(tickersByExchange);
+
+        // заявки, не снятые при откате открытия, живы в стакане и могут исполниться —
+        // не забываем их: каждый тик пробуем отменить снова
+        await SweepStrayOrdersAsync(ct);
 
         var options = config.Current.Arbitrage;
         var mode = config.Current.General.NetworkMode;
@@ -249,6 +276,80 @@ public sealed class ArbTradeExecutor(
 
         /// <summary>Нога мертва: отклонена, отменена, истекла или пропала.</summary>
         public bool Dead { get; set; }
+    }
+
+    /// <summary>Заявка, которую не удалось снять при откате открытия (может исполниться сама).</summary>
+    private sealed class StrayOrder(IExchangeConnector connector, string orderId, string symbol, OrderSide side)
+    {
+        public IExchangeConnector Connector { get; } = connector;
+
+        public string OrderId { get; } = orderId;
+
+        public string Symbol { get; } = symbol;
+
+        public OrderSide Side { get; } = side;
+    }
+
+    /// <summary>
+    /// Доснимает «потерянные» заявки, не отменённые при откате открытия: живая лимитка в стакане
+    /// может исполниться и создать экспозицию вне всякого учёта. Каждый тик пробуем отменить
+    /// снова; если успела исполниться — берём символ во внешнюю экспозицию для расчёта лимитов.
+    /// </summary>
+    private async Task SweepStrayOrdersAsync(CancellationToken ct)
+    {
+        StrayOrder[] strays;
+        lock (_strayOrders)
+        {
+            if (_strayOrders.Count == 0)
+            {
+                return;
+            }
+
+            strays = [.. _strayOrders];
+        }
+
+        foreach (var stray in strays)
+        {
+            var update = await stray.Connector.FetchOrderAsync(stray.OrderId, stray.Symbol, ct);
+            if (update is null || update.IsDead)
+            {
+                lock (_strayOrders)
+                {
+                    _strayOrders.Remove(stray);
+                }
+
+                log.Warning($"[{stray.Connector.DisplayName}] «потерянная» заявка {stray.Symbol} {stray.Side} больше не живёт на бирже");
+                continue;
+            }
+
+            if (update.IsFilled)
+            {
+                lock (_strayOrders)
+                {
+                    _strayOrders.Remove(stray);
+                }
+
+                RecordExternalExposure(stray.Connector.Id, stray.Symbol);
+                log.Error($"[{stray.Connector.DisplayName}] «потерянная» заявка {stray.Symbol} {stray.Side} исполнилась — позиция вне учёта, учитываю её в лимитах");
+                continue;
+            }
+
+            await stray.Connector.CancelOrderAsync(stray.OrderId, stray.Symbol, ct);
+        }
+    }
+
+    /// <summary>Помечает символ как имеющий экспозицию на бирже вне учёта сеанса (для расчёта лимитов).</summary>
+    private void RecordExternalExposure(string exchangeId, string symbol)
+    {
+        lock (_externalExposure)
+        {
+            if (!_externalExposure.TryGetValue(exchangeId, out var symbols))
+            {
+                _externalExposure[exchangeId] = symbols = new HashSet<string>(StringComparer.Ordinal);
+            }
+
+            symbols.Add(symbol);
+        }
     }
 
     private async Task OpenAsync(SpreadEstimate estimate, ArbitrageOptions options, CancellationToken ct)
@@ -653,6 +754,18 @@ public sealed class ArbTradeExecutor(
             {
                 log.Error($"[{leg.Connector.DisplayName}] после откатов остаётся {leg.Request.Side} × {Formatting.Volume(residuals[i])} — передаю цикл ведения");
             }
+
+            if (!leg.Dead && !leg.Done && leg.OrderId is not null)
+            {
+                // заявку так и не сняли: она может исполниться сама и создать экспозицию вне
+                // всякого учёта — не теряем её, цикл ведения продолжит отмену каждый тик
+                lock (_strayOrders)
+                {
+                    _strayOrders.Add(new StrayOrder(leg.Connector, leg.OrderId, leg.Request.Symbol, leg.Request.Side));
+                }
+
+                log.Error($"[{leg.Connector.DisplayName}] {leg.Request.Symbol} {leg.Request.Side} × {Formatting.Volume(leg.Request.Amount)}: заявку снять не удалось — она остаётся в стакане, её отменой займётся цикл ведения");
+            }
         }
 
         _ = ct; // откат выполняется по CancellationToken.None: он важнее выхода из процесса
@@ -1008,8 +1121,36 @@ public sealed class ArbTradeExecutor(
         var closed = Math.Min(leg.Filled, size);
         if (closed <= 0m && policy.Type == OrderType.Market)
         {
-            // рыночная заявка прошла, но биржа не вернула объём: считаем ногу закрытой целиком
-            closed = size;
+            // Раньше «market без объёма в ответе» засчитывался исполненным целиком: если заявка
+            // на деле не прошла, позиция слетала с учёта, а на бирже оставалась живая нога —
+            // и слот лимита освобождался под новый арбитраж поверх старого. Теперь исполнение
+            // подтверждается статусом заявки, а при нуле — отсутствием позиции на бирже.
+            var update = leg.OrderId is not null
+                ? await connector.FetchOrderAsync(leg.OrderId, position.Symbol, ct)
+                : null;
+            if (update is not null)
+            {
+                RecordFill(leg, update.FilledAmount, update.AveragePrice);
+                closed = Math.Min(leg.Filled, size);
+            }
+
+            if (closed <= 0m && update is { IsFilled: true })
+            {
+                closed = size; // статус «исполнен», но объёма биржа не вернула — доверяем статусу
+            }
+
+            if (closed <= 0m)
+            {
+                var exposureSide = side == OrderSide.Sell ? OrderSide.Buy : OrderSide.Sell;
+                if (await HasExchangePositionAsync(connector, exposureSide, position.Symbol, ct))
+                {
+                    return (0m, leg.AveragePrice, update is null
+                        ? "рыночная заявка не подтверждена биржей"
+                        : $"рыночная заявка не исполнена (статус: {update.Status})");
+                }
+
+                closed = size; // позиции на бирже нет — нога действительно закрыта
+            }
         }
 
         return (closed, leg.AveragePrice, leg.Error);
@@ -1176,8 +1317,10 @@ public sealed class ArbTradeExecutor(
     private Dictionary<string, int> CountPerExchange()
     {
         Dictionary<string, int> counts = new(StringComparer.Ordinal);
+        HashSet<string> trackedSymbols;
         lock (_positions)
         {
+            trackedSymbols = new HashSet<string>(_positions.Keys, StringComparer.Ordinal);
             foreach (var position in _positions.Values)
             {
                 counts[position.LongExchangeId] = counts.GetValueOrDefault(position.LongExchangeId) + 1;
@@ -1185,7 +1328,156 @@ public sealed class ArbTradeExecutor(
             }
         }
 
+        // экспозиция вне сеанса тоже занимает слоты биржи; символы своих позиций не считаем дважды
+        lock (_externalExposure)
+        {
+            foreach (var (exchangeId, symbols) in _externalExposure)
+            {
+                var extra = symbols.Count(symbol => !trackedSymbols.Contains(symbol));
+                if (extra > 0)
+                {
+                    counts[exchangeId] = counts.GetValueOrDefault(exchangeId) + extra;
+                }
+            }
+        }
+
         return counts;
+    }
+
+    /// <summary>Число «внешних» арбитражей: символ с ненулевой экспозицией сразу на 2+ биржах.</summary>
+    private int CountExternalArbitrages()
+    {
+        HashSet<string> trackedSymbols;
+        lock (_positions)
+        {
+            trackedSymbols = new HashSet<string>(_positions.Keys, StringComparer.Ordinal);
+        }
+
+        lock (_externalExposure)
+        {
+            var legsPerSymbol = new Dictionary<string, int>(StringComparer.Ordinal);
+            foreach (var symbols in _externalExposure.Values)
+            {
+                foreach (var symbol in symbols)
+                {
+                    if (trackedSymbols.Contains(symbol))
+                    {
+                        continue; // наша же позиция: её слот уже учтён как сеансовая
+                    }
+
+                    legsPerSymbol[symbol] = legsPerSymbol.GetValueOrDefault(symbol) + 1;
+                }
+            }
+
+            return legsPerSymbol.Values.Count(legs => legs >= 2);
+        }
+    }
+
+    /// <summary>
+    /// Сверка с биржами: лимиты MaxOpenPositions/MaxPositionsPerExchange должны учитывать
+    /// фактическую экспозицию, а не только позиции текущего сеанса — иначе после рестарта
+    /// (или потерянной позиции) бот при лимите 1 открывал «ещё одну» поверх живой.
+    /// Символы позиций под ведением исключаются, чтобы не считать их дважды.
+    /// </summary>
+    private async Task ReconcileExternalExposureAsync(CancellationToken ct)
+    {
+        if (config.Current.General.NetworkMode == NetworkMode.DryRun)
+        {
+            return; // симуляция не выставляет заявок на биржу — сверяться не с чем
+        }
+
+        var now = time.GetUtcNow();
+        if (_lastReconcileAt != default && now - _lastReconcileAt < ReconcileInterval)
+        {
+            return; // не чаще раза в минуту: fetchPositions — приватный запрос на биржу
+        }
+
+        _lastReconcileAt = now;
+
+        // снимок прошлой сверки: при сбое запроса сохраняем известную экспозицию —
+        // слоты лимитов не должны «освобождаться» из-за сетевой недоступности биржи
+        Dictionary<string, HashSet<string>> previous;
+        lock (_externalExposure)
+        {
+            previous = _externalExposure.ToDictionary(
+                kv => kv.Key,
+                kv => new HashSet<string>(kv.Value, StringComparer.Ordinal),
+                StringComparer.Ordinal);
+        }
+
+        var fresh = new Dictionary<string, HashSet<string>>(StringComparer.Ordinal);
+        foreach (var connector in registry.Connectors)
+        {
+            try
+            {
+                var positions = await connector.FetchPositionsAsync(ct);
+                var symbols = positions
+                    .Where(p => p.Amount > 0m)
+                    .Select(p => p.Symbol)
+                    .ToHashSet(StringComparer.Ordinal);
+
+                if (symbols.Count > 0)
+                {
+                    fresh[connector.Id] = symbols;
+                }
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                if (_reconcileFailWarned.Add(connector.Id))
+                {
+                    log.Warning($"[{connector.DisplayName}] сверка позиций недоступна: {ex.Message} — лимиты считаются только по позициям сеанса");
+                }
+
+                logger.LogDebug(ex, "FetchPositions reconcile failed on {ExchangeId}", connector.Id);
+                if (previous.TryGetValue(connector.Id, out var stale))
+                {
+                    fresh[connector.Id] = stale; // консервативно: помним прошлый результат
+                }
+            }
+        }
+
+        lock (_positions)
+        {
+            foreach (var position in _positions.Values)
+            {
+                if (fresh.TryGetValue(position.LongExchangeId, out var longs))
+                {
+                    longs.Remove(position.Symbol);
+                }
+
+                if (fresh.TryGetValue(position.ShortExchangeId, out var shorts))
+                {
+                    shorts.Remove(position.Symbol);
+                }
+            }
+        }
+
+        bool report;
+        lock (_externalExposure)
+        {
+            report = _externalExposure.Count == 0 && fresh.Any(kv => kv.Value.Count > 0);
+            _externalExposure.Clear();
+            foreach (var (exchangeId, symbols) in fresh)
+            {
+                if (symbols.Count > 0)
+                {
+                    _externalExposure[exchangeId] = symbols;
+                }
+            }
+        }
+
+        if (report)
+        {
+            var description = string.Join("; ", fresh
+                .Where(kv => kv.Value.Count > 0)
+                .OrderBy(kv => kv.Key, StringComparer.Ordinal)
+                .Select(kv => $"{kv.Key}: {string.Join(", ", kv.Value.OrderBy(s => s, StringComparer.Ordinal))}"));
+            log.Warning($"На биржах найдены позиции вне учёта этого сеанса ({description}) — они занимают слоты лимитов MaxOpenPositions/MaxPositionsPerExchange");
+        }
     }
 
     private void UpdateTickerCache(IReadOnlyDictionary<string, IReadOnlyDictionary<string, TickerSnapshot>> tickersByExchange)
@@ -1206,6 +1498,28 @@ public sealed class ArbTradeExecutor(
 
     private TickerSnapshot? FindTicker(string exchangeId, string symbol) => _lastTickers.TryGetValue(exchangeId, out var bucket)
         && bucket.TryGetValue(symbol, out var ticker) ? ticker : null;
+
+    /// <summary>
+    /// Есть ли у биржи фактическая позиция ноги (сторона экспозиции — противоположная закрытию).
+    /// Сбой сверки трактуем как «позиция есть»: пусть лучше закрытие повторится на следующем
+    /// тике, чем живая позиция потеряется из учёта.
+    /// </summary>
+    private static async Task<bool> HasExchangePositionAsync(IExchangeConnector connector, OrderSide exposureSide, string symbol, CancellationToken ct)
+    {
+        try
+        {
+            var positions = await connector.FetchPositionsAsync(ct);
+            return positions.Any(p => p.Symbol == symbol && p.Side == exposureSide && p.Amount > 0m);
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch (Exception)
+        {
+            return true;
+        }
+    }
 
     private static string Describe(CloseReason reason) => reason switch
     {

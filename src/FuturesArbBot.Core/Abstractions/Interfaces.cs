@@ -63,6 +63,9 @@ public interface IExchangeConnector : IAsyncDisposable
     /// <summary>Актуальное состояние ордера; null — ордер не найден.</summary>
     Task<OrderUpdate?> FetchOrderAsync(string orderId, string symbol, CancellationToken ct = default);
 
+    /// <summary>Фактические открытые позиции биржи — для сверки лимитов с реальностью.</summary>
+    Task<IReadOnlyList<PositionSnapshot>> FetchPositionsAsync(CancellationToken ct = default);
+
     /// <summary>Отменить ордер. false — отмена не прошла (например, уже исполнен).</summary>
     Task<bool> CancelOrderAsync(string orderId, string symbol, CancellationToken ct = default);
 

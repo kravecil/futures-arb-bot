@@ -114,3 +114,9 @@ public sealed record OrderResult
 public sealed record FetchTickersResult(
     IReadOnlyDictionary<string, TickerSnapshot> Tickers,
     TimeSpan Latency);
+
+/// <summary>
+/// Фактическая открытая позиция на бирже (снимок для сверки лимитов):
+/// Side — сторона экспозиции (Buy — лонг, Sell — шорт), Amount — контракты, не нулевой объём.
+/// </summary>
+public sealed record PositionSnapshot(string Symbol, OrderSide Side, decimal Amount, decimal? EntryPrice);

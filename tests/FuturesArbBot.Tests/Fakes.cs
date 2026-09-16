@@ -117,8 +117,35 @@ public sealed class FakeConnector : IExchangeConnector
     /// <summary>Отменённые через фейк заявки (orderId).</summary>
     public List<string> CancelledOrders { get; } = [];
 
+    /// <summary>
+    /// Перекрыть поведение отмены: false — отмена «не проходит», заявка остаётся в стакане;
+    /// null/true — дефолтное поведение фейка.
+    /// </summary>
+    public Func<string, bool>? CancelOrderOverride { get; set; }
+
+    /// <summary>Фактические позиции «биржи» для тестов сверки лимитов (пусто — внешних позиций нет).</summary>
+    public List<PositionSnapshot> OpenPositions { get; } = [];
+
+    /// <summary>Если true — запрос списка позиций падает (имитация недоступной сверки).</summary>
+    public bool FailFetchPositions { get; set; }
+
+    public Task<IReadOnlyList<PositionSnapshot>> FetchPositionsAsync(CancellationToken ct = default)
+    {
+        if (FailFetchPositions)
+        {
+            throw new InvalidOperationException("сверка позиций недоступна");
+        }
+
+        return Task.FromResult<IReadOnlyList<PositionSnapshot>>([.. OpenPositions]);
+    }
+
     public Task<bool> CancelOrderAsync(string orderId, string symbol, CancellationToken ct = default)
     {
+        if (CancelOrderOverride?.Invoke(orderId) == false)
+        {
+            return Task.FromResult(false);
+        }
+
         if (!OrderStates.TryGetValue(orderId, out var state) || state.Status != OrderStatus.Open)
         {
             return Task.FromResult(false);

@@ -311,6 +311,35 @@ public sealed class CcxtExchangeConnector : IExchangeConnector
         }
     }
 
+    public async Task<IReadOnlyList<PositionSnapshot>> FetchPositionsAsync(CancellationToken ct = default)
+    {
+        // исключения не глотаем: вызывающий код сам решает, что делать при недоступности
+        // сверки (reconcile консервативно сохраняет прошлый снимок, закрытие — не «обнуляет» позицию)
+        ct.ThrowIfCancellationRequested();
+        var positions = await _api.FetchPositions();
+
+        var result = new List<PositionSnapshot>();
+        foreach (var position in positions)
+        {
+            if (position.symbol is not { Length: > 0 } symbol)
+            {
+                continue;
+            }
+
+            var contracts = position.contracts ?? 0.0;
+            if (contracts <= 0.0)
+            {
+                continue; // закрытые позиции биржи отдают нулевыми — экспозиции в них нет
+            }
+
+            var side = position.side == "short" ? OrderSide.Sell : OrderSide.Buy;
+            decimal? entry = position.entryPrice is { } openPrice && openPrice > 0.0 ? (decimal)openPrice : null;
+            result.Add(new PositionSnapshot(symbol, side, (decimal)contracts, entry));
+        }
+
+        return result;
+    }
+
     private static OrderStatus MapStatus(string? status) => status switch
     {
         "open" or "pending" or "unfilled" or "partially_filled" or "partially-closed" => OrderStatus.Open,
