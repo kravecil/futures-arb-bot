@@ -62,6 +62,22 @@ public sealed class FakeConnector : IExchangeConnector
     public Task<FetchTickersResult> FetchTickersAsync(CancellationToken ct = default) =>
         Task.FromResult(new FetchTickersResult(Tickers, TimeSpan.FromMilliseconds(12)));
 
+    /// <summary>Фандинг-рейты «биржи»: symbol → ставка в % (пусто — данных нет).</summary>
+    public Dictionary<string, decimal> FundingRatesPercent { get; set; } = [];
+
+    /// <summary>Если true — запрос фандинг-рейтов падает (имитация недоступного эндпоинта).</summary>
+    public bool FailFetchFundingRates { get; set; }
+
+    public Task<IReadOnlyDictionary<string, decimal>> FetchFundingRatesPercentAsync(CancellationToken ct = default)
+    {
+        if (FailFetchFundingRates)
+        {
+            throw new InvalidOperationException("фандинг-рейты недоступны");
+        }
+
+        return Task.FromResult<IReadOnlyDictionary<string, decimal>>(FundingRatesPercent);
+    }
+
     /// <summary>Все ордера, выставленные через фейк: orderId → запрос.</summary>
     public Dictionary<string, OrderRequest> PlacedOrders { get; } = new(StringComparer.Ordinal);
 
@@ -167,6 +183,29 @@ public sealed class FakeConnector : IExchangeConnector
     }
 
     public ValueTask DisposeAsync() => ValueTask.CompletedTask;
+}
+
+/// <summary>Исполнитель-регистратор: вместо торговли фиксирует полученные кандидаты.</summary>
+public sealed class FakeExecutor : ITradeExecutor
+{
+    /// <summary>Все списки кандидатов, переданные в ProcessOpportunitiesAsync.</summary>
+    public List<List<SpreadEstimate>> ProcessedBatches { get; } = [];
+
+    /// <summary>Все кандидаты всех batches одним списком.</summary>
+    public List<SpreadEstimate> Processed => [.. ProcessedBatches.SelectMany(b => b)];
+
+    public bool HasOpenPositions => false;
+
+    public Task ProcessOpportunitiesAsync(IReadOnlyList<SpreadEstimate> candidates, CancellationToken ct)
+    {
+        ProcessedBatches.Add([.. candidates]);
+        return Task.CompletedTask;
+    }
+
+    public Task ManageOpenPositionsAsync(IReadOnlyDictionary<string, IReadOnlyDictionary<string, TickerSnapshot>> tickersByExchange, CancellationToken ct) =>
+        Task.CompletedTask;
+
+    public Task CloseAllAsync(CloseReason reason, CancellationToken ct) => Task.CompletedTask;
 }
 
 /// <summary>Часы, шагающие вперёд при каждом чтении — чтобы циклы ожидания не зависали.</summary>

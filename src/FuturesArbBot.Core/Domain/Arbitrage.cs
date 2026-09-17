@@ -4,7 +4,11 @@ namespace FuturesArbBot.Core.Domain;
 public sealed record OpportunityLeg(
     string ExchangeId,
     decimal Price,
-    decimal FeePercent);
+    decimal FeePercent)
+{
+    /// <summary>Фандинг-рейт по ноге в % (null — биржа не отдала данные).</summary>
+    public decimal? FundingPercent { get; init; }
+}
 
 /// <summary>
 /// Оценка арбитражной возможности: купить дешевле на одной бирже и продать дороже

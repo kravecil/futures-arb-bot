@@ -28,6 +28,9 @@ public static class Formatting
     /// <summary>Процент со знаком и тремя знаками после запятой.</summary>
     public static string Pct(decimal percent) => percent.ToString("+0.000;-0.000;0.000", CultureInfo.InvariantCulture) + "%";
 
+    /// <summary>Процент или «нет данных» для отсутствующего значения (например, фандинг-рейта ноги).</summary>
+    public static string OptionalPct(decimal? percent) => percent is { } value ? Pct(value) : "н/д";
+
     /// <summary>Длительность в виде «1д 02:03:04» / «02:03:04».</summary>
     public static string Duration(TimeSpan span) => span.TotalDays >= 1
         ? $"{(int)span.TotalDays}д {span:hh\\:mm\\:ss}"

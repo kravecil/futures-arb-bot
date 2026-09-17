@@ -18,6 +18,7 @@ public sealed class ArbitrageScanner(
     private Dictionary<string, IExchangeConnector> _connectors = new(StringComparer.Ordinal);
     private Dictionary<string, HashSet<string>> _allowedSymbols = new(StringComparer.Ordinal);
     private readonly Dictionary<string, DateTimeOffset> _lastSignalLog = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, DateTimeOffset> _lastFundingSkipLog = new(StringComparer.Ordinal);
     private DashboardSnapshot? _snapshot;
     private bool _prepared;
 
@@ -62,8 +63,9 @@ public sealed class ArbitrageScanner(
         var options = config.Current;
         var fetched = await FetchAllAsync(ct);
         var totalFetched = fetched.Sum(f => f.Result.Tickers.Count);
+        var funding = await FetchFundingAsync(ct);
 
-        var estimates = Evaluate(fetched, options, out var trackedSymbols);
+        var estimates = Evaluate(fetched, funding, options, out var trackedSymbols);
 
         stats.RecordScanTick(totalFetched);
         foreach (var estimate in estimates)
@@ -74,9 +76,25 @@ public sealed class ArbitrageScanner(
         var top = estimates.Take(options.General.ConsoleUi.TopRows).ToList();
         _snapshot = stats.BuildDashboard(top, _connectors.Count, trackedSymbols);
 
-        var candidates = estimates
+        var aboveSpread = estimates
             .Where(e => e.NetPercent >= options.Arbitrage.MinSpreadPercentUp)
             .ToList();
+
+        // фильтр по фандингу: если хотя бы по одной ноге рейт строго ниже предела —
+        // пропускаем сделку целиком (обе ноги открываются одной парой)
+        var limit = options.Arbitrage.MinFundingRatePercent;
+        var candidates = new List<SpreadEstimate>(aboveSpread.Count);
+        foreach (var candidate in aboveSpread)
+        {
+            if (candidate.LongLeg.FundingPercent < limit || candidate.ShortLeg.FundingPercent < limit)
+            {
+                LogFundingSkip(candidate, limit);
+                continue;
+            }
+
+            candidates.Add(candidate);
+        }
+
         LogSignals(candidates);
 
         if (options.Arbitrage.Enabled && candidates.Count > 0)
@@ -158,8 +176,44 @@ public sealed class ArbitrageScanner(
         return [.. results.Where(r => r.Result is not null).Select(r => (r.Connector, r.Result!))];
     }
 
+    /// <summary>
+    /// Собирает фандинг-рейты по всем биржам (коннекторы кэшируют ответы сами).
+    /// Ошибка одной биржи не влияет на остальные: пустая карта = «данных нет» = fail-open.
+    /// </summary>
+    private async Task<Dictionary<string, IReadOnlyDictionary<string, decimal>>> FetchFundingAsync(CancellationToken ct)
+    {
+        var tasks = registry.Connectors.Select(async connector =>
+        {
+            try
+            {
+                return (Id: connector.Id, Rates: await connector.FetchFundingRatesPercentAsync(ct));
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                log.Debug($"[funding] {connector.Id}: {ex.Message}");
+                return (connector.Id, (IReadOnlyDictionary<string, decimal>)new Dictionary<string, decimal>());
+            }
+        });
+
+        var map = new Dictionary<string, IReadOnlyDictionary<string, decimal>>(StringComparer.Ordinal);
+        foreach (var (id, rates) in await Task.WhenAll(tasks))
+        {
+            map[id] = rates;
+        }
+
+        return map;
+    }
+
     /// <summary>Ищет лучшие пары «дешёвая/дорогая биржа» по каждому символу.</summary>
-    private List<SpreadEstimate> Evaluate(List<(IExchangeConnector Connector, FetchTickersResult Result)> fetched, BotOptions options, out int trackedSymbols)
+    private List<SpreadEstimate> Evaluate(
+        List<(IExchangeConnector Connector, FetchTickersResult Result)> fetched,
+        Dictionary<string, IReadOnlyDictionary<string, decimal>> funding,
+        BotOptions options,
+        out int trackedSymbols)
     {
         var symbolsOptions = options.Symbols;
         var volumeMinimum = symbolsOptions.MinQuoteVolume24hUsd;
@@ -245,6 +299,17 @@ public sealed class ArbitrageScanner(
             var estimate = calculator.Calculate(cheaper, richer, FeesOf(cheaper.ExchangeId, symbol), FeesOf(richer.ExchangeId, symbol));
             if (estimate is not null)
             {
+                var longFunding = FundingOf(funding, cheaper.ExchangeId, symbol);
+                var shortFunding = FundingOf(funding, richer.ExchangeId, symbol);
+                if (longFunding is not null || shortFunding is not null)
+                {
+                    estimate = estimate with
+                    {
+                        LongLeg = estimate.LongLeg with { FundingPercent = longFunding },
+                        ShortLeg = estimate.ShortLeg with { FundingPercent = shortFunding },
+                    };
+                }
+
                 estimates.Add(estimate);
             }
         }
@@ -256,6 +321,24 @@ public sealed class ArbitrageScanner(
     private ExchangeFees FeesOf(string exchangeId, string symbol) => _connectors.TryGetValue(exchangeId, out var connector)
         ? (connector.TryGetFees(symbol, out var fees) ? fees : connector.DefaultFees)
         : new ExchangeFees(0.1m, 0.05m);
+
+    /// <summary>Фандинг-рейт ноги в %; null — биржа не отдала данные (fail-open).</summary>
+    private static decimal? FundingOf(Dictionary<string, IReadOnlyDictionary<string, decimal>> funding, string exchangeId, string symbol)
+        => funding.TryGetValue(exchangeId, out var rates) && rates.TryGetValue(symbol, out var rate) ? rate : null;
+
+    /// <summary>Отказ по фандингу пишется в журнал не чаще раза в минуту на символ.</summary>
+    private void LogFundingSkip(SpreadEstimate candidate, decimal limit)
+    {
+        var now = time.GetUtcNow();
+        if (_lastFundingSkipLog.TryGetValue(candidate.Symbol, out var last) && now - last < TimeSpan.FromMinutes(1))
+        {
+            return;
+        }
+
+        _lastFundingSkipLog[candidate.Symbol] = now;
+        log.Info($"Пропуск {candidate.Symbol}: фандинг лонг {Formatting.OptionalPct(candidate.LongLeg.FundingPercent)} / " +
+                 $"шорт {Formatting.OptionalPct(candidate.ShortLeg.FundingPercent)} — ниже предела {Formatting.Pct(limit)}, сделка не открывается");
+    }
 
     /// <summary>Сигналы пишутся в журнал не чаще раза в минуту на символ.</summary>
     private void LogSignals(IReadOnlyList<SpreadEstimate> candidates)

@@ -66,6 +66,12 @@ public interface IExchangeConnector : IAsyncDisposable
     /// <summary>Фактические открытые позиции биржи — для сверки лимитов с реальностью.</summary>
     Task<IReadOnlyList<PositionSnapshot>> FetchPositionsAsync(CancellationToken ct = default);
 
+    /// <summary>
+    /// Актуальные фандинг-рейты биржи: symbol → ставка в % за период (отрицательная — лонги получают).
+    /// Пустой словарь — биржа не отдаёт данные; реализация кэширует ответ (рейты меняются редко).
+    /// </summary>
+    Task<IReadOnlyDictionary<string, decimal>> FetchFundingRatesPercentAsync(CancellationToken ct = default);
+
     /// <summary>Отменить ордер. false — отмена не прошла (например, уже исполнен).</summary>
     Task<bool> CancelOrderAsync(string orderId, string symbol, CancellationToken ct = default);
 

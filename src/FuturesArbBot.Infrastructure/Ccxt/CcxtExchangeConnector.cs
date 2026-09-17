@@ -23,6 +23,12 @@ public sealed class CcxtExchangeConnector : IExchangeConnector
     private readonly Dictionary<string, ExchangeFees> _feesBySymbol = new(StringComparer.Ordinal);
     private ExchangeFees _defaultFees = new(0.1m, 0.05m);
 
+    // --- фандинг-рейты: редкий кэш (рейты обновляются раз в 4–8 часов, REST-эндпоинт тяжёлый) ---
+    private static readonly TimeSpan FundingCacheTtl = TimeSpan.FromMinutes(5);
+    private IReadOnlyDictionary<string, decimal> _fundingCache = new Dictionary<string, decimal>();
+    private DateTimeOffset _fundingFetchedAt = DateTimeOffset.MinValue;
+    private bool _fundingUnavailableLogged;
+
     public CcxtExchangeConnector(ExchangeConfigEntry entry, NetworkMode mode, IEventLog log, TimeProvider time, ILogger logger)
     {
         _entry = entry;
@@ -338,6 +344,46 @@ public sealed class CcxtExchangeConnector : IExchangeConnector
         }
 
         return result;
+    }
+
+    public async Task<IReadOnlyDictionary<string, decimal>> FetchFundingRatesPercentAsync(CancellationToken ct = default)
+    {
+        var now = _time.GetUtcNow();
+        if (now - _fundingFetchedAt < FundingCacheTtl)
+        {
+            return _fundingCache;
+        }
+
+        _fundingFetchedAt = now;
+        try
+        {
+            ct.ThrowIfCancellationRequested();
+            var response = await _api.FetchFundingRates();
+
+            var rates = new Dictionary<string, decimal>(_markets.Count, StringComparer.Ordinal);
+            foreach (var (symbol, fundingRate) in response.fundingRates)
+            {
+                if (fundingRate.fundingRate is { } rate && _markets.ContainsKey(symbol))
+                {
+                    rates[symbol] = (decimal)rate * 100m; // дробь CCXT (0.0001) → проценты (0.01 %)
+                }
+            }
+
+            _fundingCache = rates;
+            _fundingUnavailableLogged = false;
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            // fail-open: без данных фандинга сделки не блокируются — предупредим один раз до первого успеха
+            if (!_fundingUnavailableLogged)
+            {
+                _fundingUnavailableLogged = true;
+                _log.Error($"[{DisplayName}] фандинг-рейты недоступны: {ExplainError(ex)} — фильтр по фандингу будет пропускать сделки");
+                _logger.LogDebug(ex, "FetchFundingRates failed for {ExchangeId}", Id);
+            }
+        }
+
+        return _fundingCache;
     }
 
     private static OrderStatus MapStatus(string? status) => status switch
