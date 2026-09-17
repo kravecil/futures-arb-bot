@@ -16,6 +16,9 @@ public sealed class BotOptions
 
     [Required]
     public ExchangesOptions Exchanges { get; set; } = new();
+
+    /// <summary>Уведомления администратору в MAX Messenger (notifications.json → Notifications).</summary>
+    public NotificationOptions Notifications { get; set; } = new();
 }
 
 /// <summary>Общие настройки приложения (appsettings.json → General).</summary>

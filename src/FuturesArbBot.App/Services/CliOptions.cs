@@ -13,6 +13,12 @@ public sealed record CliOptions
 
     public bool ShowHelp { get; private init; }
 
+    /// <summary>Проверить токен MAX и прислать тестовое сообщение (биржи не подключаются).</summary>
+    public bool NotifyTest { get; private init; }
+
+    /// <summary>Показать chat_id администратора: ждёт входящих сообщений от вас (биржи не подключаются).</summary>
+    public bool NotifyChatId { get; private init; }
+
     public static CliOptions Parse(string[] args)
     {
         CliOptions options = new();
@@ -43,6 +49,14 @@ public sealed record CliOptions
                     options = options with { ConfigDir = args[++i] };
                     break;
 
+                case "--notify-test":
+                    options = options with { NotifyTest = true };
+                    break;
+
+                case "--notify-chat-id":
+                    options = options with { NotifyChatId = true };
+                    break;
+
                 default:
                     throw new ArgumentException($"Неизвестный аргумент: {args[i]} (см. --help)");
             }
@@ -62,10 +76,15 @@ public sealed record CliOptions
         table.AddRow("[cyan]--once[/]", "выполнить одно сканирование, показать сводку и выйти");
         table.AddRow("[cyan]--no-ui[/]", "без Live-дашборда; события печатаются обычным потоком");
         table.AddRow("[cyan]--config-dir <путь>[/]", "каталог конфигурации (по умолчанию: ./config)");
+        table.AddRow("[cyan]--notify-test[/]", "проверить токен MAX и прислать тестовое сообщение в чат администратора");
+        table.AddRow("[cyan]--notify-chat-id[/]", "показать chat_id: отправьте боту любое сообщение, робот прочитает его из /updates");
         table.AddRow("[cyan]--help[/]", "показать справку");
         AnsiConsole.Write(table);
         AnsiConsole.MarkupLine("[grey]Примеры:[/] dotnet run --project src/FuturesArbBot.App -- --once");
         AnsiConsole.MarkupLine("       dotnet run --project src/FuturesArbBot.App -- --config-dir ./config");
+        AnsiConsole.MarkupLine("       dotnet run --project src/FuturesArbBot.App -- --notify-chat-id");
+        AnsiConsole.WriteLine();
+        AnsiConsole.MarkupLine("[grey]Уведомления настраиваются в config/notifications.json (раздел Notifications); токен безопаснее задавать переменной ARB_Notifications__BotToken.[/]");
         AnsiConsole.WriteLine();
         AnsiConsole.MarkupLine("[yellow]Ctrl+C[/] — корректная остановка с подробной статистикой сеанса.");
     }

@@ -3,7 +3,7 @@ FROM mcr.microsoft.com/dotnet/sdk:10.0 AS build
 WORKDIR /src
 
 COPY Directory.Build.props Directory.Packages.props global.json ./
-COPY FuturesArbBot.sln ./
+COPY FuturesArbBot.slnx ./
 COPY src/FuturesArbBot.Core/FuturesArbBot.Core.csproj            src/FuturesArbBot.Core/
 COPY src/FuturesArbBot.Infrastructure/FuturesArbBot.Infrastructure.csproj src/FuturesArbBot.Infrastructure/
 COPY src/FuturesArbBot.App/FuturesArbBot.App.csproj              src/FuturesArbBot.App/

@@ -136,3 +136,24 @@ public interface IArbitrageScanner
 
     DashboardSnapshot? Snapshot { get; }
 }
+
+/// <summary>
+/// Отправитель уведомлений об обнаруженных арбитражных сигналах. Обязательное свойство
+/// реализации — не блокировать сканер: очередь внутренняя, сбои транспорта логируются,
+/// а не бросаются наружу.
+/// </summary>
+public interface ISpreadNotifier
+{
+    /// <summary>Поставить сигнал в очередь на отправку (возвращает управление немедленно).</summary>
+    void Notify(SpreadEstimate estimate);
+}
+
+/// <summary>Доставка готового текста уведомления во внешний мессенджер (реализация — в Infrastructure).</summary>
+public interface INotificationTransport
+{
+    /// <summary>
+    /// Отправить текст администратору. Реализация сама выполняет повторы (429/5xx/сеть)
+    /// с экспоненциальной задержкой и возвращает итог: доставлено или тип сбоя.
+    /// </summary>
+    Task<NotificationDelivery> SendAsync(string text, CancellationToken ct = default);
+}

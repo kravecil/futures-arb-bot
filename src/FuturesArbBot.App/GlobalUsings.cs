@@ -5,6 +5,7 @@ global using FuturesArbBot.Core.Domain;
 global using FuturesArbBot.Core.Engine;
 global using FuturesArbBot.Infrastructure.Ccxt;
 global using FuturesArbBot.Infrastructure.Configuration;
+global using FuturesArbBot.Infrastructure.Notifications;
 global using Microsoft.Extensions.DependencyInjection;
 global using Microsoft.Extensions.Logging;
 global using Spectre.Console;

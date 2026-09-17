@@ -11,6 +11,7 @@ public sealed class ArbitrageScanner(
     ISymbolFilter filter,
     ITradeExecutor executor,
     IStatisticsCollector stats,
+    ISpreadNotifier notifier,
     IEventLog log,
     TimeProvider time,
     ILogger<ArbitrageScanner> logger) : IArbitrageScanner
@@ -96,6 +97,7 @@ public sealed class ArbitrageScanner(
         }
 
         LogSignals(candidates);
+        NotifySignals(candidates);
 
         if (options.Arbitrage.Enabled && candidates.Count > 0)
         {
@@ -353,6 +355,23 @@ public sealed class ArbitrageScanner(
 
             _lastSignalLog[candidate.Symbol] = now;
             log.Success($"Сигнал {candidate.Symbol}: лонг {candidate.LongLeg.ExchangeId} @ {Formatting.Price(candidate.LongLeg.Price)} → шорт {candidate.ShortLeg.ExchangeId} @ {Formatting.Price(candidate.ShortLeg.Price)}, нетто {Formatting.Pct(candidate.NetPercent)}");
+        }
+    }
+
+    /// <summary>
+    /// Отправить отобранные сигналы администратору. Очередь отправителя неблокирующая,
+    /// а все сбои логируются им самим — уведомления не могут остановить сканирование.
+    /// </summary>
+    private void NotifySignals(List<SpreadEstimate> candidates)
+    {
+        if (candidates.Count == 0 || !config.Current.Notifications.IsUsable)
+        {
+            return;
+        }
+
+        foreach (var candidate in candidates)
+        {
+            notifier.Notify(candidate);
         }
     }
 }

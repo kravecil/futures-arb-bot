@@ -16,14 +16,17 @@ public static class Formatting
     /// <summary>Сумма в долларах со знаком.</summary>
     public static string Usd(decimal amount) => string.Create(CultureInfo.InvariantCulture, $"{amount:+#,0.00;-#,0.00;#,0.00} $");
 
-    /// <summary>Объём в «человекочитаемом» виде: 12.3M, 456K…</summary>
+    /// <summary>Объём в «человекочитаемом» виде: 12.3M, 456K… Разделитель — всегда точка.</summary>
     public static string Volume(decimal value) => Math.Abs(value) switch
     {
-        >= 1_000_000_000m => $"{value / 1_000_000_000m:0.#}B",
-        >= 1_000_000m => $"{value / 1_000_000m:0.#}M",
-        >= 1_000m => $"{value / 1_000m:0.#}K",
-        _ => value.ToString("0.#", CultureInfo.InvariantCulture),
+        >= 1_000_000_000m => Invariant(value / 1_000_000_000m) + "B",
+        >= 1_000_000m => Invariant(value / 1_000_000m) + "M",
+        >= 1_000m => Invariant(value / 1_000m) + "K",
+        _ => Invariant(value),
     };
+
+    /// <summary>Десятичное с «0.#» в инвариантной культуре: точка, а не запятая.</summary>
+    private static string Invariant(decimal value) => value.ToString("0.#", CultureInfo.InvariantCulture);
 
     /// <summary>Процент со знаком и тремя знаками после запятой.</summary>
     public static string Pct(decimal percent) => percent.ToString("+0.000;-0.000;0.000", CultureInfo.InvariantCulture) + "%";

@@ -1,0 +1,22 @@
+{
+  "_comment": "Необязательный раздел: уведомления администратору в MAX Messenger о спред-сигналах, прошедших фильтры робота (MinSpreadPercentUp и проверка фандинга). Файл можно удалить — тогда уведомления выключены. Токен безопаснее задавать переменной окружения ARB_Notifications__BotToken, а chat_id узнавать через --notify-chat-id (бот не может написать вам первым: сначала отправьте боту любое сообщение).",
+
+  "Notifications": {
+    "Enabled": false,
+    "BotToken": "",
+    "AdminChatId": "",
+    "ApiBaseUrl": "https://platform-api2.max.ru",
+    "Endpoint": "Messages",
+    "MinSpreadPercent": null,
+    "UseMarkdown": false,
+    "Silent": false,
+    "SignalCooldownSeconds": 120,
+    "MaxPerMinute": 20,
+    "TimeoutMs": 5000,
+    "MaxRetries": 3,
+    "FailureCircuitLimit": 5,
+    "CircuitBreakMinutes": 10,
+    "QueueCapacity": 64,
+    "TextTemplate": "Арбитраж {symbol}: нетто {net} (gross {gross})\nлонг {longExchange} @ {longPrice} → шорт {shortExchange} @ {shortPrice}\nфандинг {longFunding}/{shortFunding} · объём {volume} $ · {time}"
+  }
+}

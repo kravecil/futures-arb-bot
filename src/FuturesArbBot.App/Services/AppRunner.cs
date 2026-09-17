@@ -52,6 +52,7 @@ public sealed class AppRunner(
 
         _state = new RunState();
         log.Info($"Сеанс запущен: режим {config.Current.General.NetworkMode}, бирж {connectors.Count}, торговля {(config.Current.Arbitrage.Enabled ? "ВКЛЮЧЕНА" : "выключена (мониторинг)")}");
+        LogNotificationState(config.Current.Notifications);
 
         var scanner = services.GetRequiredService<IArbitrageScanner>();
 
@@ -296,6 +297,25 @@ public sealed class AppRunner(
         }
 
         log.Info("Сеанс завершён.");
+    }
+
+    /// <summary>Строка журнала про канал уведомлений: включён, не настроен или выключен.</summary>
+    private void LogNotificationState(NotificationOptions notifications)
+    {
+        if (notifications.IsUsable)
+        {
+            var threshold = notifications.MinSpreadPercent ?? config.Current.Arbitrage.MinSpreadPercentUp;
+            log.Info($"Уведомления в MAX: включены (чат {notifications.AdminChatId}, порог {Formatting.Pct(threshold)}, не чаще одного на символ в {notifications.SignalCooldownSeconds} с)");
+            return;
+        }
+
+        if (notifications.Enabled)
+        {
+            log.Warning("Уведомления включены, но BotToken или AdminChatId не заданы — сигналы не отправляются. Помощь: --notify-test и --notify-chat-id.");
+            return;
+        }
+
+        log.Debug("Уведомления выключены (Notifications:Enabled = false).");
     }
 
     private void PrintFinalReport()

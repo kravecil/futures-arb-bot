@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using FuturesArbBot.Core.Abstractions;
 using FuturesArbBot.Core.Domain;
 using FuturesArbBot.Core.Engine;
@@ -185,6 +186,63 @@ public sealed class FakeConnector : IExchangeConnector
     public ValueTask DisposeAsync() => ValueTask.CompletedTask;
 }
 
+/// <summary>Отправитель-регистратор: собирает сигналы, переданные в очередь уведомлений.</summary>
+public sealed class FakeNotifier : ISpreadNotifier
+{
+    /// <summary>Все сигналы, поставленные в очередь (по одному вызову Notify).</summary>
+    public List<SpreadEstimate> Notified { get; } = [];
+
+    public void Notify(SpreadEstimate estimate) => Notified.Add(estimate);
+}
+
+/// <summary>
+/// Транспорт уведомлений: вместо HTTP записывает тексты и отдаёт заготовленные исходы.
+/// i-я отправка получает <see cref="Outcomes"/>[i] (последний элемент повторяется), null = успешно.
+/// </summary>
+public sealed class FakeTransport : INotificationTransport
+{
+    private readonly ConcurrentQueue<string> _sent = new();
+    private int _calls;
+
+    /// <summary>Исходы по порядку вызовов; null в списке = доставка успешна.</summary>
+    public List<NotificationDelivery?> Outcomes { get; } = [];
+
+    /// <summary>Задан — бросается при отправке (имитация падения транспорта).</summary>
+    public Exception? ThrowOnSend { get; set; }
+
+    /// <summary>Задан — ожидание перед возвратом (имитация долгой сети).</summary>
+    public TimeSpan Delay { get; set; }
+
+    /// <summary>Снимок отправленных текстов (копия — очередь живёт в фоне).</summary>
+    public IReadOnlyList<string> Sent => [.. _sent];
+
+    /// <summary>Сколько раз обратились к транспорту.</summary>
+    public int CallCount => Volatile.Read(ref _calls);
+
+    public async Task<NotificationDelivery> SendAsync(string text, CancellationToken ct = default)
+    {
+        var index = Interlocked.Increment(ref _calls) - 1;
+        _sent.Enqueue(text);
+
+        if (ThrowOnSend is { } fault)
+        {
+            throw fault;
+        }
+
+        if (Delay > TimeSpan.Zero)
+        {
+            await Task.Delay(Delay, ct);
+        }
+
+        if (Outcomes.Count == 0)
+        {
+            return NotificationDelivery.Delivered;
+        }
+
+        return Outcomes[Math.Min(index, Outcomes.Count - 1)] ?? NotificationDelivery.Delivered;
+    }
+}
+
 /// <summary>Исполнитель-регистратор: вместо торговли фиксирует полученные кандидаты.</summary>
 public sealed class FakeExecutor : ITradeExecutor
 {
@@ -206,6 +264,16 @@ public sealed class FakeExecutor : ITradeExecutor
         Task.CompletedTask;
 
     public Task CloseAllAsync(CloseReason reason, CancellationToken ct) => Task.CompletedTask;
+}
+
+/// <summary>Часы, которые тест сдвигает вручную (кулдаун, окно лимита в минуту).</summary>
+public sealed class ManualTimeProvider(DateTimeOffset start) : TimeProvider
+{
+    private DateTimeOffset _now = start;
+
+    public override DateTimeOffset GetUtcNow() => _now;
+
+    public void Advance(TimeSpan by) => _now += by;
 }
 
 /// <summary>Часы, шагающие вперёд при каждом чтении — чтобы циклы ожидания не зависали.</summary>

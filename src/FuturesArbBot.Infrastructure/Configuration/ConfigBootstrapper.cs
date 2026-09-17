@@ -3,15 +3,19 @@ using Microsoft.Extensions.Configuration;
 namespace FuturesArbBot.Infrastructure.Configuration;
 
 /// <summary>
-/// Загрузка конфигурации из трёх JSON-файлов каталога config/:
+/// Загрузка конфигурации из JSON-файлов каталога config/:
 /// appsettings.json — общие настройки и арбитраж,
 /// exchanges.json — список бирж и ключи,
-/// symbols.json — фильтры торговых пар.
+/// symbols.json — фильтры торговых пар,
+/// notifications.json — (необязательный) раздел уведомлений администратору.
 /// Изменения подхватываются «на лету» (reloadOnChange).
 /// </summary>
 public static class ConfigBootstrapper
 {
     private static readonly string[] Files = ["appsettings.json", "exchanges.json", "symbols.json"];
+
+    /// <summary>Файлы, которых может не быть: разделы берутся из значений по умолчанию.</summary>
+    private static readonly string[] OptionalFiles = ["notifications.json"];
 
     public static (IConfigurationRoot Config, string Directory) Load(string? configuredDirectory)
     {
@@ -21,6 +25,11 @@ public static class ConfigBootstrapper
         foreach (var file in Files)
         {
             builder.AddJsonFile(file, optional: false, reloadOnChange: true);
+        }
+
+        foreach (var file in OptionalFiles)
+        {
+            builder.AddJsonFile(file, optional: true, reloadOnChange: true);
         }
 
         builder.AddEnvironmentVariables("ARB_");
@@ -74,6 +83,7 @@ public sealed class ConfigProvider(IConfiguration configuration, string director
         Arbitrage = configuration.GetSection("Arbitrage").Get<ArbitrageOptions>() ?? new(),
         Symbols = configuration.GetSection("Symbols").Get<SymbolsOptions>() ?? new(),
         Exchanges = configuration.GetSection("Exchanges").Get<ExchangesOptions>() ?? new(),
+        Notifications = configuration.GetSection("Notifications").Get<NotificationOptions>() ?? new(),
     };
 
     public string ConfigDirectory => directory;

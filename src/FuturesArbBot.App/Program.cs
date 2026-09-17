@@ -25,6 +25,14 @@ Console.CancelKeyPress += (_, eventArgs) =>
     cts.Cancel();
 };
 
+// Служебные режимы проверки уведомлений: биржи не подключаются, только MAX Bot API.
+if (NotificationCli.Requested(cli))
+{
+    var notifyCode = await NotificationCli.RunAsync(cli, cts.Token);
+    WaitForKeyPress();
+    return notifyCode;
+}
+
 using var app = Bootstrapper.Build(cli);
 int exitCode;
 try

@@ -6,6 +6,7 @@
 
   <ItemGroup>
     <ProjectReference Include="..\..\src\FuturesArbBot.Core\FuturesArbBot.Core.csproj" />
+    <ProjectReference Include="..\..\src\FuturesArbBot.Infrastructure\FuturesArbBot.Infrastructure.csproj" />
   </ItemGroup>
 
   <ItemGroup>
