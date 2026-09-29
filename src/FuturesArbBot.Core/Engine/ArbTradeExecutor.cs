@@ -129,7 +129,12 @@ public sealed class ArbTradeExecutor(
                 }
 
                 var currentGross = (shortTicker.Bid - longTicker.Ask) / longTicker.Ask * 100m;
-                var reason = currentGross <= options.MinSpreadPercentDown ? CloseReason.TakeProfit
+                // «текущий спред» меряется теми же сторонами стакана, что и вход, и потому оптимистичен
+                // на ширину обоих стаканов: закрывается пара продажей лонга по его bid и выкупом шорта по
+                // его ask. Считаем оставшийся PnL при немедленном выходе и разрешаем тейк-профит только
+                // в плюсе — иначе «фиксация прибыли» закрывала бы сделку с убытком.
+                var netNow = NetProfitPercent(position, longTicker, shortTicker);
+                var reason = currentGross <= options.MinSpreadPercentDown && netNow > 0m ? CloseReason.TakeProfit
                     : currentGross >= options.StopLossSpreadPercent ? CloseReason.StopLoss
                     : now - position.OpenedAt >= TimeSpan.FromMinutes(options.MaxPositionAgeMinutes) ? CloseReason.Timeout
                     : (CloseReason?)null;
@@ -891,7 +896,26 @@ public sealed class ArbTradeExecutor(
         }
 
         stats.RecordOpened(position);
-        log.Success($"Открыт арбитраж {position.Symbol}: {Formatting.Volume(position.MatchedSize)} × лонг {position.LongExchangeId} @ {Formatting.Price(position.EntryLong)} / шорт {position.ShortExchangeId} @ {Formatting.Price(position.EntryShort)}");
+        // диагностика исполнения: насколько фактическая средняя цена каждой ноги ушла от котировки,
+        // на которой робот посчитал спред. Именно это отклонение (а не направление заявки) съедает edge.
+        var slipLong = SlippagePercent(entryLong, estimate.LongLeg.Price, OrderSide.Buy);
+        var slipShort = SlippagePercent(entryShort, estimate.ShortLeg.Price, OrderSide.Sell);
+        log.Success($@"Открыт арбитраж {position.Symbol}: {Formatting.Volume(position.MatchedSize)} × лонг {position.LongExchangeId} @ {Formatting.Price(position.EntryLong)} / шорт {position.ShortExchangeId} @ {Formatting.Price(position.EntryShort)}, проскальзывание от котировки сигнала: лонг {Formatting.Pct(slipLong)}, шорт {Formatting.Pct(slipShort)}");
+    }
+
+    /// <summary>
+    /// Проскальзывание ноги в процентах: сколько потеряно против котировки сигнала.
+    /// Покупка дороже котировки и продажа дешевле котировки — потеря (положительный знак).
+    /// </summary>
+    private static decimal SlippagePercent(decimal filled, decimal quoted, OrderSide side)
+    {
+        if (quoted <= 0m)
+        {
+            return 0m;
+        }
+
+        var deviation = side == OrderSide.Buy ? filled - quoted : quoted - filled;
+        return deviation / quoted * 100m;
     }
 
     /// <summary>
@@ -1075,6 +1099,34 @@ public sealed class ArbTradeExecutor(
     /// <summary>Taker-комиссия биржи по символу (процентом).</summary>
     private static decimal TakerPercent(IExchangeConnector connector, string symbol) =>
         connector.TryGetFees(symbol, out var fees) ? fees.TakerPercent : connector.DefaultFees.TakerPercent;
+
+    /// <summary>Taker-комиссия биржи по её id (процентом); 0 — биржи нет в реестре.</summary>
+    private decimal TakerPercentOf(string exchangeId, string symbol) =>
+        registry.Connectors.FirstOrDefault(c => c.Id == exchangeId) is { } connector
+            ? TakerPercent(connector, symbol)
+            : 0m;
+
+    /// <summary>
+    /// Расчётный PnL пары в процентах оборота при закрытии прямо сейчас: валовый спред,
+    /// зафиксированный на входе, минус стоимость немедленного выхода (лонг — продажа по его bid,
+    /// шорт — выкуп по его ask) и минус taker-комиссии полного круга. Пороги коридора сами по
+    /// себе не видят ширину стаканов и комиссий выхода, поэтому без этой оценки тейк-профит
+    /// может «фиксировать прибыль» там, где по факту остаётся убыток.
+    /// </summary>
+    private decimal NetProfitPercent(PositionPair position, TickerSnapshot longTicker, TickerSnapshot shortTicker)
+    {
+        if (position.EntryLong <= 0m || longTicker.Bid <= 0m)
+        {
+            return 0m;
+        }
+
+        var entryGross = (position.EntryShort - position.EntryLong) / position.EntryLong * 100m;
+        var unwindCost = (shortTicker.Ask - longTicker.Bid) / longTicker.Bid * 100m;
+        var roundTripFees = 2m * (TakerPercentOf(position.LongExchangeId, position.Symbol)
+            + TakerPercentOf(position.ShortExchangeId, position.Symbol));
+
+        return entryGross - unwindCost - roundTripFees;
+    }
 
     // ------------------------- закрытие -------------------------
 

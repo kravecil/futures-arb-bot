@@ -1,11 +1,17 @@
 namespace FuturesArbBot.Core.Engine;
 
 /// <summary>
-/// Расчёт спреда между двумя биржами. Нетто = (bid богатыx − ask дешёвой) / ask дешёвой
-/// минус комиссии taker обеих ног и буфер на проскальзывание.
+/// Расчёт спреда между двумя биржами. Брутто = (bid богатых − ask дешёвой) / ask дешёвой.
+/// Нетто = брутто − комиссии taker полного круга − буфер на проскальзывание. Полного круга,
+/// потому что пару не только открывают двумя ногами (buy дешёвой + sell богатых), но и закрывают
+/// двумя (sell дешёвой + buy богатых): четыре комиссии taker. Считать только вход — значит вдвое
+/// занижать стоимость сделки и пропускать сигналы, убыточные уже на пороге входа.
 /// </summary>
 public sealed class SpreadCalculator(IConfigProvider config, TimeProvider time) : ISpreadCalculator
 {
+    /// <summary>Открытие и закрытие пары — два прохода по обеим ногам.</summary>
+    private const decimal RoundTripMultiplier = 2m;
+
     public SpreadEstimate? Calculate(TickerSnapshot cheaper, TickerSnapshot richer, ExchangeFees cheapFees, ExchangeFees richFees)
     {
         if (cheaper.ExchangeId == richer.ExchangeId || !cheaper.IsTradable || !richer.IsTradable)
@@ -27,7 +33,8 @@ public sealed class SpreadCalculator(IConfigProvider config, TimeProvider time) 
             return null;
         }
 
-        var feeCost = options.IncludeFees ? cheapFees.TakerPercent + richFees.TakerPercent : 0m;
+        var entryFees = options.IncludeFees ? cheapFees.TakerPercent + richFees.TakerPercent : 0m;
+        var feeCost = entryFees * RoundTripMultiplier;
         var net = gross - feeCost - options.SlippageBufferPercent;
 
         if (net <= 0m)

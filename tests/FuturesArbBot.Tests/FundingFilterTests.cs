@@ -5,9 +5,10 @@ using Microsoft.Extensions.Logging.Abstractions;
 namespace FuturesArbBot.Tests;
 
 /// <summary>
-/// Фильтр открытия по фандингу: если фандинг хотя бы по одной ноге строго ниже
-/// Arbitrage:MinFundingRatePercent — сделка пропускается целиком (обе ноги одной парой).
-/// Нет данных о фандинге — fail-open (сделка разрешена).
+/// Фильтр открытия по фандингу: считается чистый фандинг пары за интервал — рейт шорта минус
+/// рейт лонга (позиция платит положительный рейт по лонгу и отрицательный по шорту). Если он
+/// строго ниже Arbitrage:MinFundingRatePercent — сделка пропускается целиком (обе ноги одной парой).
+/// Нет данных хотя бы по одной ноге — fail-open (сделка разрешена).
 /// </summary>
 public class FundingFilterTests
 {
@@ -23,7 +24,7 @@ public class FundingFilterTests
         options.Arbitrage.SlippageBufferPercent = 0m;
         var config = new FakeConfigProvider(options);
 
-        // спред: ask дешёвой 100 → bid дорогой 101, комиссии 0.1+0.1 → нетто ~0.8% > порога 0.4%
+        // спред: ask дешёвой 100 → bid дорогой 101, комиссии круга 0.1×4 → нетто 0.6% > порога 0.4%
         var longConnector = new FakeConnector("binanceusdm");
         longConnector.Tickers = new Dictionary<string, TickerSnapshot>
         {
@@ -64,8 +65,10 @@ public class FundingFilterTests
     }
 
     [Fact]
-    public async Task Both_legs_above_limit_candidate_passes_with_funding_on_legs()
+    public async Task Pair_income_above_limit_passes_and_funding_is_on_legs()
     {
+        // лонг при рейте −0.5 % получает 0.5 %, шорт при рейте −0.2 % платит 0.2 %:
+        // чистый доход пары = −0.2 − (−0.5) = +0.3 %, выше предела −1 % — сделка разрешена
         var (scanner, longConnector, shortConnector, executor, notifier, _) = Create();
         longConnector.FundingRatesPercent[Symbol] = -0.5m;
         shortConnector.FundingRatesPercent[Symbol] = -0.2m;
@@ -79,13 +82,41 @@ public class FundingFilterTests
     }
 
     [Fact]
-    public async Task One_leg_below_limit_whole_pair_skipped()
+    public async Task Pair_paying_over_limit_whole_pair_skipped()
     {
-        // из задания: по одной ноге -1.5% (ниже предела -1%), по второй -0.5% (норм) —
-        // сделка не открывается ни по одной ноге
+        // лонг платит +1.5 %, шорт при −0.2 % платит ещё 0.2 %: чистый доход пары −1.7 %,
+        // что ниже предела −1 % — фандинг съедает спред, сделка не открывается вовсе
+        var (scanner, longConnector, shortConnector, executor, notifier, _) = Create();
+        longConnector.FundingRatesPercent[Symbol] = 1.5m;
+        shortConnector.FundingRatesPercent[Symbol] = -0.2m;
+
+        await scanner.ScanOnceAsync(CancellationToken.None);
+
+        Assert.Empty(executor.Processed);
+    }
+
+    [Fact]
+    public async Task Deep_negative_funding_on_short_leg_is_income_not_a_reason_to_skip()
+    {
+        // прежняя трактовка («провальная» нога — рейт ниже предела) отбрасывала эту связку из-за
+        // −1.5 % по лонгу, хотя как раз лонг с отрицательным рейтом нам и платит: доход пары +1.0 %
         var (scanner, longConnector, shortConnector, executor, notifier, _) = Create();
         longConnector.FundingRatesPercent[Symbol] = -1.5m;
         shortConnector.FundingRatesPercent[Symbol] = -0.5m;
+
+        await scanner.ScanOnceAsync(CancellationToken.None);
+
+        Assert.Single(executor.Processed);
+    }
+
+    [Fact]
+    public async Task Skew_between_legs_is_skipped_although_each_rate_looks_normal()
+    {
+        // по каждой ноге рейты «в норме» (оба выше −1 %), но платить мы должны 1.1 % за интервал —
+        // раньше такой связки фильтр не видел
+        var (scanner, longConnector, shortConnector, executor, notifier, _) = Create();
+        longConnector.FundingRatesPercent[Symbol] = 0.9m;
+        shortConnector.FundingRatesPercent[Symbol] = -0.2m;
 
         await scanner.ScanOnceAsync(CancellationToken.None);
 
@@ -141,8 +172,8 @@ public class FundingFilterTests
         options.Notifications.Enabled = true;
         options.Notifications.BotToken = "token";
         options.Notifications.AdminChatId = "42";
-        longConnector.FundingRatesPercent[Symbol] = -1.5m;
-        shortConnector.FundingRatesPercent[Symbol] = -0.5m;
+        longConnector.FundingRatesPercent[Symbol] = 1.5m;
+        shortConnector.FundingRatesPercent[Symbol] = -0.2m;
 
         await scanner.ScanOnceAsync(CancellationToken.None);
 
@@ -165,8 +196,8 @@ public class FundingFilterTests
     public async Task Rate_equal_to_limit_passes_strictly_below_rejects()
     {
         var (scanner, longConnector, shortConnector, executor, notifier, _) = Create();
-        longConnector.FundingRatesPercent[Symbol] = -1m; // ровно предел — не «ниже», пропускаем
-        shortConnector.FundingRatesPercent[Symbol] = -0.999m;
+        longConnector.FundingRatesPercent[Symbol] = 1m;
+        shortConnector.FundingRatesPercent[Symbol] = 0m; // чистый доход пары ровно −1 % — предел, не «ниже»
 
         await scanner.ScanOnceAsync(CancellationToken.None);
 
@@ -177,12 +208,46 @@ public class FundingFilterTests
     public async Task Configurable_limit_is_respected()
     {
         var (scanner, longConnector, shortConnector, executor, notifier, options) = Create();
-        options.Arbitrage.MinFundingRatePercent = 0m; // запрет на отрицательный фандинг
+        options.Arbitrage.MinFundingRatePercent = 0m; // связка не должна платить фандинг вовсе
         longConnector.FundingRatesPercent[Symbol] = 0.1m;
         shortConnector.FundingRatesPercent[Symbol] = -0.001m;
 
         await scanner.ScanOnceAsync(CancellationToken.None);
 
         Assert.Empty(executor.Processed);
+    }
+
+    [Fact]
+    public async Task Legs_with_too_different_timestamps_do_not_make_a_signal()
+    {
+        // котировка дешёвой биржи на 20 с «старше» котировки дорогой: обе проходят общий фильтр
+        // возраста, но сравнивать их уже нельзя — большую часть спреда мог дать сдвиг рынка за лаг
+        var (scanner, longConnector, shortConnector, executor, _, options) = Create();
+        options.Symbols.MaxTickerAgeSeconds = 600;
+        options.Symbols.MaxTickerSkewSeconds = 5;
+        longConnector.Tickers = new Dictionary<string, TickerSnapshot>
+        {
+            [Symbol] = TestTickers.Make("binanceusdm", Symbol, bid: 99.9m, ask: 100m, ts: Now - TimeSpan.FromSeconds(20)),
+        };
+
+        await scanner.ScanOnceAsync(CancellationToken.None);
+
+        Assert.Empty(executor.Processed);
+    }
+
+    [Fact]
+    public async Task Legs_within_skew_limit_still_make_a_signal()
+    {
+        var (scanner, longConnector, shortConnector, executor, _, options) = Create();
+        options.Symbols.MaxTickerAgeSeconds = 600;
+        options.Symbols.MaxTickerSkewSeconds = 30;
+        longConnector.Tickers = new Dictionary<string, TickerSnapshot>
+        {
+            [Symbol] = TestTickers.Make("binanceusdm", Symbol, bid: 99.9m, ask: 100m, ts: Now - TimeSpan.FromSeconds(20)),
+        };
+
+        await scanner.ScanOnceAsync(CancellationToken.None);
+
+        Assert.Single(executor.Processed);
     }
 }

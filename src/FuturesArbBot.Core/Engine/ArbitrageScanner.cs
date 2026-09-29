@@ -81,13 +81,15 @@ public sealed class ArbitrageScanner(
             .Where(e => e.NetPercent >= options.Arbitrage.MinSpreadPercentUp)
             .ToList();
 
-        // фильтр по фандингу: если хотя бы по одной ноге рейт строго ниже предела —
-        // пропускаем сделку целиком (обе ноги открываются одной парой)
+        // фильтр по фандингу: важен не уровень рейта каждой ноги по отдельности, а то, платит пара
+        // или получает целиком. Лонг платит положительный рейт, шорт платит отрицательный, поэтому
+        // чистый фандинг позиции за интервал = рейт шорта − рейт лонга. Строго ниже предела —
+        // фандинг съедает спред, и сделка пропускается целиком (обе ноги открываются одной парой).
         var limit = options.Arbitrage.MinFundingRatePercent;
         var candidates = new List<SpreadEstimate>(aboveSpread.Count);
         foreach (var candidate in aboveSpread)
         {
-            if (candidate.LongLeg.FundingPercent < limit || candidate.ShortLeg.FundingPercent < limit)
+            if (NetFundingPercent(candidate) < limit)
             {
                 LogFundingSkip(candidate, limit);
                 continue;
@@ -220,6 +222,7 @@ public sealed class ArbitrageScanner(
         var symbolsOptions = options.Symbols;
         var volumeMinimum = symbolsOptions.MinQuoteVolume24hUsd;
         var maxAge = TimeSpan.FromSeconds(symbolsOptions.MaxTickerAgeSeconds);
+        var maxSkew = TimeSpan.FromSeconds(symbolsOptions.MaxTickerSkewSeconds);
         var now = time.GetUtcNow();
 
         var book = new Dictionary<string, Dictionary<string, TickerSnapshot>>(4096, StringComparer.Ordinal);
@@ -298,6 +301,15 @@ public sealed class ArbitrageScanner(
                 continue;
             }
 
+            // котировки разных бирж снимаются параллельно и с разными задержками: если одна нога
+            // старше другой больше чем на MaxTickerSkewSeconds, расхождение мог породить сдвиг рынка
+            // за время лага, а не реальная разница цен — такую пару не считаем вовсе
+            if (cheaper.Timestamp != default && richer.Timestamp != default
+                && (cheaper.Timestamp - richer.Timestamp).Duration() > maxSkew)
+            {
+                continue;
+            }
+
             var estimate = calculator.Calculate(cheaper, richer, FeesOf(cheaper.ExchangeId, symbol), FeesOf(richer.ExchangeId, symbol));
             if (estimate is not null)
             {
@@ -328,6 +340,18 @@ public sealed class ArbitrageScanner(
     private static decimal? FundingOf(Dictionary<string, IReadOnlyDictionary<string, decimal>> funding, string exchangeId, string symbol)
         => funding.TryGetValue(exchangeId, out var rates) && rates.TryGetValue(symbol, out var rate) ? rate : null;
 
+    /// <summary>
+    /// Чистый фандинг пары за интервал, %: позиция платит рейт лонга и получает рейт шорта,
+    /// поэтому доход = рейт шорта − рейт лонга. null — хотя бы по одной ноге данных нет
+    /// (сравнение с null всегда ложно, то есть сделка разрешена — fail-open).
+    /// </summary>
+    private static decimal? NetFundingPercent(SpreadEstimate candidate)
+    {
+        var longRate = candidate.LongLeg.FundingPercent;
+        var shortRate = candidate.ShortLeg.FundingPercent;
+        return longRate is null || shortRate is null ? null : shortRate - longRate;
+    }
+
     /// <summary>Отказ по фандингу пишется в журнал не чаще раза в минуту на символ.</summary>
     private void LogFundingSkip(SpreadEstimate candidate, decimal limit)
     {
@@ -339,7 +363,8 @@ public sealed class ArbitrageScanner(
 
         _lastFundingSkipLog[candidate.Symbol] = now;
         log.Info($"Пропуск {candidate.Symbol}: фандинг лонг {Formatting.OptionalPct(candidate.LongLeg.FundingPercent)} / " +
-                 $"шорт {Formatting.OptionalPct(candidate.ShortLeg.FundingPercent)} — ниже предела {Formatting.Pct(limit)}, сделка не открывается");
+                 $"шорт {Formatting.OptionalPct(candidate.ShortLeg.FundingPercent)}, чистый для позиции " +
+                 $"{Formatting.OptionalPct(NetFundingPercent(candidate))} — ниже предела {Formatting.Pct(limit)}, сделка не открывается");
     }
 
     /// <summary>Сигналы пишутся в журнал не чаще раза в минуту на символ.</summary>

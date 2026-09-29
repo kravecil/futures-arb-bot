@@ -1,4 +1,4 @@
-using FuturesArbBot.Core.Abstractions;
+﻿using FuturesArbBot.Core.Abstractions;
 using FuturesArbBot.Core.Domain;
 using FuturesArbBot.Core.Engine;
 using Microsoft.Extensions.Logging.Abstractions;
@@ -93,6 +93,72 @@ public class ArbTradeExecutorTests
                           - (100m + 101m + 100.4m + 100.7m) * 0.1m / 100m;
         Assert.Equal(expectedPnl, trade.PnlUsd, 6);
         Assert.True(trade.Simulated);
+    }
+
+    [Fact]
+    public async Task Take_profit_is_skipped_when_unwinding_would_lock_a_loss()
+    {
+        var (executor, longConnector, shortConnector, stats) = Create();
+
+        // вход: куплен лонг по 100 (ask дешёвой), продан шорт по 101 (bid дорогой) — зафиксировано 1 %
+        var estimate = Estimate("BTC/USDT:USDT", longPrice: 100m, shortPrice: 101m);
+        await executor.ProcessOpportunitiesAsync([estimate], CancellationToken.None);
+        Assert.True(executor.HasOpenPositions);
+
+        // спред «по сторонам входа» сжался до 0.1 % — ниже порога тейка 0.15 %. Но стаканы широкие:
+        // лонг пришлось бы продавать по 100.0, а шорт выкупать по 101.9, то есть выход стоит 1.9 %
+        // плюс 0.4 % комиссий круга. Расчётный PnL немедленного выхода −1.3 % — закрывать невыгодно.
+        longConnector.Tickers = new Dictionary<string, TickerSnapshot>
+        {
+            ["BTC/USDT:USDT"] = TestTickers.Make("binanceusdm", "BTC/USDT:USDT", bid: 100m, ask: 100.9m),
+        };
+        shortConnector.Tickers = new Dictionary<string, TickerSnapshot>
+        {
+            ["BTC/USDT:USDT"] = TestTickers.Make("bybit", "BTC/USDT:USDT", bid: 101m, ask: 101.9m),
+        };
+
+        await executor.ManageOpenPositionsAsync(
+            new Dictionary<string, IReadOnlyDictionary<string, TickerSnapshot>>
+            {
+                ["binanceusdm"] = longConnector.Tickers,
+                ["bybit"] = shortConnector.Tickers,
+            },
+            CancellationToken.None);
+
+        // прежняя логика назвала бы это «фиксацией прибыли» и закрыла сделку в минус
+        Assert.True(executor.HasOpenPositions);
+        Assert.Empty(stats.Snapshot(Now.AddMinutes(1)).ClosedPositions);
+    }
+
+    [Fact]
+    public async Task Take_profit_fires_when_unwind_is_genuinely_in_profit()
+    {
+        var (executor, longConnector, shortConnector, stats) = Create();
+        var estimate = Estimate("ETH/USDT:USDT", longPrice: 100m, shortPrice: 101m);
+        await executor.ProcessOpportunitiesAsync([estimate], CancellationToken.None);
+
+        // узкие стаканы и почти сошнённые цены: выход по 100.4/100.5 и 100.6/100.7 стоит 0.3 %,
+        // остаётся 1 % − 0.3 % − 0.4 % комиссий = +0.3 % — тейк-профит легитимен
+        longConnector.Tickers = new Dictionary<string, TickerSnapshot>
+        {
+            ["ETH/USDT:USDT"] = TestTickers.Make("binanceusdm", "ETH/USDT:USDT", bid: 100.4m, ask: 100.5m),
+        };
+        shortConnector.Tickers = new Dictionary<string, TickerSnapshot>
+        {
+            ["ETH/USDT:USDT"] = TestTickers.Make("bybit", "ETH/USDT:USDT", bid: 100.6m, ask: 100.7m),
+        };
+
+        await executor.ManageOpenPositionsAsync(
+            new Dictionary<string, IReadOnlyDictionary<string, TickerSnapshot>>
+            {
+                ["binanceusdm"] = longConnector.Tickers,
+                ["bybit"] = shortConnector.Tickers,
+            },
+            CancellationToken.None);
+
+        var trade = Assert.Single(stats.Snapshot(Now.AddMinutes(1)).ClosedPositions);
+        Assert.Equal(CloseReason.TakeProfit, trade.Reason);
+        Assert.True(trade.PnlUsd > 0m);
     }
 
     [Fact]

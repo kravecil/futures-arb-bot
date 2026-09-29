@@ -6,6 +6,7 @@
     "MinQuoteVolume24hUsd": 5000000,
     "MaxSymbols": 400,
     "MaxTickerAgeSeconds": 15,
+    "MaxTickerSkewSeconds": 5,
     "Include": [],
     "Exclude": [
       "*UP/USDT:*",
