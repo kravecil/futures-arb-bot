@@ -7,12 +7,11 @@
     "MaxSymbols": 400,
     "MaxTickerAgeSeconds": 15,
     "MaxTickerSkewSeconds": 5,
-    "Include": [],
+    "Include": [ 
+   	
+    ],
     "Exclude": [
-      "*UP/USDT:*",
-      "*DOWN/USDT:*",
-      "*BULL/USDT:*",
-      "*BEAR/USDT:*"
+      "*ONE/USDT:*"  
     ]
   }
 }

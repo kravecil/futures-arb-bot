@@ -6,14 +6,14 @@
       {
         "Id": "binanceusdm",
         "Name": "Binance USD-M Futures",
-        "Enabled": true,
+        "Enabled": false,
         "ApiKey": "",
         "Secret": ""
       },
       {
         "Id": "bybit",
         "Name": "Bybit Linear",
-        "Enabled": true,
+        "Enabled": false,
         "ApiKey": "",
         "Secret": ""
       },
@@ -21,16 +21,16 @@
         "Id": "okx",
         "Name": "OKX Swap",
         "Enabled": true,
-        "ApiKey": "",
-        "Secret": "",
-        "Password": ""
+        "ApiKey": "5f56e0bc-de2d-4129-937b-5fea6d671b2f",
+        "Secret": "645FA9FFF6D7473FC793470CB461DEDD",
+        "Password": "Amd6787828!"
       },
       {
         "Id": "gate",
         "Name": "Gate.io Futures",
-        "Enabled": false,
-        "ApiKey": "",
-        "Secret": ""
+        "Enabled": true,
+        "ApiKey": "a9a77c34a29c21194a2126b3d81cc466",
+        "Secret": "a0bb18e66416aaec7174dd59c015bd20bd39d67ca7968cfe4e3fedbbf8062b25"
       },
       {
         "Id": "mexc",
