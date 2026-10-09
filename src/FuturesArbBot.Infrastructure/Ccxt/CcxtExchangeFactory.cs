@@ -20,6 +20,7 @@ public sealed class CcxtExchangeFactory(IEventLog log, TimeProvider time, ILogge
         ["coinex"] = cfg => new coinex(cfg),
         ["phemex"] = cfg => new phemex(cfg),
         ["krakenfutures"] = cfg => new krakenfutures(cfg),
+        ["bingx"] = cfg => new bingx(cfg),
     };
 
     public IReadOnlyList<string> SupportedIds => [.. Map.Keys.OrderBy(k => k, StringComparer.OrdinalIgnoreCase)];

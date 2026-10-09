@@ -62,6 +62,9 @@ public static class ExchangeCapabilityMap
         ["coinex"] = new("coinex", true, true, true, null, false, false, false),
         ["phemex"] = new("phemex", true, true, true, null, false, false, false),
         ["krakenfutures"] = new("krakenfutures", true, true, true, null, false, false, false),
+        // BingX perpetual: timeInForce = GTC|IOC|PostOnly (FOK нет); reduceOnly — через params;
+        // chase-ордеров в публичном API нет — догоняет исполнитель (Simulated)
+        ["bingx"] = new("bingx", true, true, true, "PostOnly", true, false, false),
     };
 
     /// <summary>Возможности биржи по идентификатору (неизвестная биржа — базовый набор).</summary>

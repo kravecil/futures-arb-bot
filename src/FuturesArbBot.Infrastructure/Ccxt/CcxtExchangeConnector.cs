@@ -18,6 +18,7 @@ public sealed class CcxtExchangeConnector : IExchangeConnector
     private readonly TimeProvider _time;
     private readonly ILogger _logger;
     private readonly Exchange _api;
+    private readonly string _ccxtOptions;
 
     private readonly Dictionary<string, MarketInfo> _markets = new(StringComparer.Ordinal);
     private readonly Dictionary<string, ExchangeFees> _feesBySymbol = new(StringComparer.Ordinal);
@@ -28,6 +29,9 @@ public sealed class CcxtExchangeConnector : IExchangeConnector
     private IReadOnlyDictionary<string, decimal> _fundingCache = new Dictionary<string, decimal>();
     private DateTimeOffset _fundingFetchedAt = DateTimeOffset.MinValue;
     private bool _fundingUnavailableLogged;
+
+    // плечо: предупреждаем один раз на символ — иначе неприменённое плечо остаётся невидимым
+    private readonly HashSet<string> _leverageWarned = new(StringComparer.Ordinal);
 
     public CcxtExchangeConnector(ExchangeConfigEntry entry, NetworkMode mode, IEventLog log, TimeProvider time, ILogger logger)
     {
@@ -75,6 +79,11 @@ public sealed class CcxtExchangeConnector : IExchangeConnector
         {
             config["options"] = options;
         }
+
+        // какие опции реально ушли в CCXT — без этого «ноль фьючерсных рынков» не диагностируется
+        _ccxtOptions = options.Count > 0
+            ? string.Join(", ", options.Select(kv => $"{kv.Key}={kv.Value}"))
+            : "нет";
 
         _api = CcxtExchangeFactory.Instantiate(entry.Id, config);
     }
@@ -145,6 +154,12 @@ public sealed class CcxtExchangeConnector : IExchangeConnector
         _defaultFees = new ExchangeFees(
             _entry.TakerFeePercent ?? (reference.TakerPercent > 0m ? reference.TakerPercent : 0.1m),
             _entry.MakerFeePercent ?? (reference.MakerPercent > 0m ? reference.MakerPercent : 0.05m));
+
+        _log.Debug($"[{DisplayName}] опции CCXT: {_ccxtOptions}; инструментов загружено {markets.Count}, линейных бессрочных {_markets.Count}");
+        if (_markets.Count == 0)
+        {
+            _log.Warning($"[{DisplayName}] CCXT не вернул ни одного линейного бессрочного фьючерса — проверьте defaultType в разделе Options биржи");
+        }
     }
 
     public async Task<FetchTickersResult> FetchTickersAsync(CancellationToken ct = default)
@@ -405,11 +420,23 @@ public sealed class CcxtExchangeConnector : IExchangeConnector
 
         try
         {
-            await _api.SetLeverage(leverage, symbol);
+            // BingX требует параметр side (LONG|SHORT|BOTH): счёт робота — в one-way режиме,
+            // поэтому BOTH. Остальным биржам параметры не передаём (пустой словарь = прежнее поведение).
+            Dictionary<string, object>? extra = null;
+            if (Id.Equals("bingx", StringComparison.OrdinalIgnoreCase))
+            {
+                extra = new Dictionary<string, object> { ["side"] = "BOTH" };
+            }
+
+            await _api.SetLeverage(leverage, symbol, extra);
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
             _logger.LogDebug(ex, "SetLeverage {Symbol} x{Leverage} — биржа могла не применить плечо", symbol, leverage);
+            if (_leverageWarned.Add(symbol))
+            {
+                _log.Warning($"[{DisplayName}] плечо ×{leverage} для {symbol} не применено: {ExplainError(ex)} — используется значение по умолчанию биржи");
+            }
         }
     }
 
@@ -454,7 +481,7 @@ public sealed class CcxtExchangeConnector : IExchangeConnector
     private static Dictionary<string, object> DefaultOptions(string id) => id.ToLowerInvariant() switch
     {
         "bybit" => new Dictionary<string, object> { ["defaultType"] = "swap", ["defaultSubType"] = "linear" },
-        "okx" or "gate" or "mexc" or "bitget" or "htx" or "coinex" or "phemex" => new Dictionary<string, object> { ["defaultType"] = "swap" },
+        "okx" or "gate" or "mexc" or "bitget" or "htx" or "coinex" or "phemex" or "bingx" => new Dictionary<string, object> { ["defaultType"] = "swap" },
         _ => [],
     };
 

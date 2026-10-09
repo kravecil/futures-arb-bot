@@ -61,6 +61,13 @@
         "Enabled": false,
         "ApiKey": "",
         "Secret": ""
+      },
+      {
+        "Id": "bingx",
+        "Name": "BingX Perpetual",
+        "Enabled": false,
+        "ApiKey": "",
+        "Secret": ""
       }
     ]
   }

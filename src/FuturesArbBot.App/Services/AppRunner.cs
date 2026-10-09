@@ -241,6 +241,8 @@ public sealed class AppRunner(
             {
                 AnsiConsole.MarkupLineInterpolated($"[red]✗[/] {Markup.Escape(entry.Name)}: {Markup.Escape(ex.Message)}");
                 log.Error($"[{entry.Id}] не подключилась: {ex.Message}");
+                // полный текст (тип исключения, inner, стек) — в файл журнала: иначе сбой недиагностируем
+                log.Debug($"[{entry.Id}] исключение подключения: {ex}");
             }
         }
 
