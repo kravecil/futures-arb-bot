@@ -37,8 +37,22 @@ ScaffoldingReadMe.txt
 # NuGet Symbol Packages
 *.snupkg
 
+# Python / uv
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+build/
+dist/
+.pytest_cache/
+.ruff_cache/
+
 # dotenv environment variables file
 .env
+
+# logs
+[Ll]og/
+[Ll]ogs/
 
 # Others
 ~$*

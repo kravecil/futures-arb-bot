@@ -1,0 +1,47 @@
+[project]
+name = "futures-arb-bot"
+version = "1.0.0"
+description = "Межбиржевой арбитражный робот (фьючерсы perpetual, ccxt): сканер спредов, исполнение, уведомления и Live-дашборд."
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.11"
+dependencies = [
+    "ccxt>=4.4.0",
+    "rich>=13.7.0",
+    "pyyaml>=6.0.0",
+    "python-dotenv>=1.0.0",
+    "httpx>=0.27.0",
+]
+
+[project.scripts]
+arb-bot = "futures_arb_bot.cli:main"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.24.0",
+    "ruff>=0.8.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/futures_arb_bot"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 130
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B"]
+ignore = ["E501"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["B008"]  # Decimal(...) в дефолтах тестовых хелперов — безопасно (неизменяемый тип)
+
