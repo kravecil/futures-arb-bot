@@ -3,6 +3,7 @@ HTTP-слой MAX Bot API: путь и тело запроса, заголово
 (meta.code), политика повторов и long-poll /updates.
 """
 
+import asyncio
 import json
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -213,6 +214,36 @@ async def test_poll_updates_collects_chat_ids_and_marker():
     assert [c.chat_id for c in page.chats] == ["42", "99"]
     assert page.chats[0].text == "привет"
     assert "marker=7" in urlsplit(stub.requests[0].url).query
+
+
+async def test_poll_updates_timeout_is_in_seconds_and_client_waits_longer():
+    timeouts: list[float] = []
+    stub = StubHttp(lambda _: ok('{"updates":[],"marker":5}'))
+
+    async def sender(method, url, headers, body, timeout):
+        timeouts.append(timeout)
+        return await stub(method, url, headers, body, timeout)
+
+    client = MaxMessengerClient(FakeConfigProvider(options()), ManualClock(NOW), sender=sender)
+
+    await client.poll_updates(None, wait_seconds=30)
+    await client.poll_updates(None, wait_seconds=500)
+
+    assert "timeout=30" in urlsplit(stub.requests[0].url).query  # секунды, а не миллисекунды
+    assert "timeout=90" in urlsplit(stub.requests[1].url).query  # верхняя граница API
+    assert timeouts[0] == 31.0  # ожидание сервера + timeout_ms (1 с) на передачу
+
+
+async def test_poll_updates_client_timeout_returns_empty_page_with_same_marker():
+    async def never(method, url, headers, body, timeout):
+        await asyncio.sleep(10)
+
+    client = MaxMessengerClient(FakeConfigProvider(options(lambda n: setattr(n, "timeout_ms", 500))), ManualClock(NOW), sender=never)
+
+    page = await client.poll_updates("77", wait_seconds=0)
+
+    assert page.marker == "77"
+    assert page.chats == []
 
 
 async def test_poll_updates_reports_http_error():

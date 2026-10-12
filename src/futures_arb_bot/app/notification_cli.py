@@ -20,7 +20,7 @@ from futures_arb_bot.core.engine import formatting
 from futures_arb_bot.core.engine.notification_formatter import test_message
 from futures_arb_bot.core.errors import message_of
 from futures_arb_bot.infrastructure.config import YamlConfigProvider
-from futures_arb_bot.infrastructure.max_messenger import MaxMessengerClient
+from futures_arb_bot.infrastructure.max_messenger import LONG_POLL_SECONDS, MaxMessengerClient
 
 WATCH_SECONDS = 90
 """Сколько секунд слушаем /updates в режиме поиска chat_id."""
@@ -96,7 +96,8 @@ async def _watch_chat_id(client: MaxMessengerClient, ct: CancellationToken) -> i
 
     while time.monotonic() < deadline and not ct.is_cancellation_requested:
         try:
-            page = await client.poll_updates(marker, ct)
+            remaining = int(deadline - time.monotonic())
+            page = await client.poll_updates(marker, ct, wait_seconds=max(1, min(LONG_POLL_SECONDS, remaining)))
         except OperationCanceledError:
             break
         except Exception as ex:

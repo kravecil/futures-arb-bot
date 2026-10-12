@@ -31,6 +31,12 @@ from futures_arb_bot.core.engine.logging_bridge import get_logger
 from futures_arb_bot.core.errors import message_of
 
 MAX_RETRY_AFTER = timedelta(seconds=30)
+
+LONG_POLL_SECONDS = 30
+"""Сколько сервер MAX держит запрос /updates в ожидании апдейта (по умолчанию API — 30 с)."""
+
+MAX_LONG_POLL_SECONDS = 90
+"""Верхняя граница параметра timeout у /updates по документации MAX."""
 """Больше этого значения пауза по Retry-After не ждёт — очередь не должна вставать надолго."""
 
 
@@ -151,21 +157,26 @@ class MaxMessengerClient:
         except Exception as ex:
             return MaxVerifyResult(False, message_of(ex))
 
-    async def poll_updates(self, marker: str | None, ct: CancellationToken | None = None) -> MaxUpdatesPage:
+    async def poll_updates(self, marker: str | None, ct: CancellationToken | None = None, wait_seconds: int = LONG_POLL_SECONDS) -> MaxUpdatesPage:
         """
         Одна длинная подписка GET /updates: вернуть замеченные chat_id. Так бот узнаёт адресата:
-        первым пишет администратор, робот его только читает. Таймаут — OperationCanceledError.
+        первым пишет администратор, робот его только читает.
+
+        Параметр timeout у MAX — в секундах (0…90): сервер держит запрос, пока не придёт апдейт или
+        не истечёт ожидание. HTTP-таймаут клиента — это ожидание плюс timeout_ms на саму передачу.
+        Если ответа так и не было, возвращается пустая страница с прежним маркером.
         """
         ct = ct or CancellationToken.none()
         options = self._config.current.notifications
-        query = f"updates?limit=50&timeout={min(max(options.timeout_ms, 500), 60_000)}"
+        wait = min(max(wait_seconds, 0), MAX_LONG_POLL_SECONDS)
+        query = f"updates?limit=50&timeout={wait}"
         if marker and marker.strip():
             query += f"&marker={quote(marker, safe='')}"
 
         try:
-            response = await self._request("GET", _build_url(options, query), options.bot_token, None, options.timeout_ms + 5_000, ct)
-        except TimeoutError as ex:
-            raise OperationCanceledError("A task was canceled.") from ex
+            response = await self._request("GET", _build_url(options, query), options.bot_token, None, wait * 1000 + options.timeout_ms, ct)
+        except TimeoutError:
+            return MaxUpdatesPage(marker, [])
 
         if not 200 <= response.status < 300:
             code, message = _parse_error(response.body)
@@ -202,8 +213,8 @@ class MaxMessengerClient:
             return NotificationDelivery.transient(f"сеть: {message_of(ex)}"), None
 
     async def _request(self, method: str, url: str, token: str, body: bytes | None, timeout_ms: int, ct: CancellationToken) -> HttpResponse:
-        """Запрос с таймаутом (500 мс…120 с) и прерыванием по токену отмены."""
-        timeout = min(max(timeout_ms, 500), 120_000) / 1000
+        """Запрос с таймаутом (500 мс…180 с) и прерыванием по токену отмены."""
+        timeout = min(max(timeout_ms, 500), 180_000) / 1000
         headers = {"Authorization": token.strip()}
         if body is not None:
             headers["Content-Type"] = "application/json; charset=utf-8"
