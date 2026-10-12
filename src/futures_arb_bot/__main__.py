@@ -42,57 +42,13 @@ class _Interrupts:
             pass  # цикл уже остановлен
 
 
-def _wait_for_key_press() -> None:
-    """
-    Ожидание нажатия любой клавиши перед закрытием окна консоли (актуально при запуске
-    двойным кликом: иначе окно закрывается мгновенно после Ctrl+C).
-    """
-    try:
-        if sys.stdin is None or not sys.stdin.isatty():
-            return  # служебный/перенаправленный запуск (скрипт, редирект) — не блокируем
-    except ValueError, OSError:
-        return
-
-    sys.stdout.flush()
-    sys.stderr.write("\nНажмите любую клавишу, чтобы закрыть окно…\n")
-    sys.stderr.flush()
-
-    try:
-        if os.name == "nt":
-            import msvcrt
-
-            while msvcrt.kbhit():
-                msvcrt.getwch()  # сбрасываем «залежавшиеся» нажатия (например, из дашборда)
-            msvcrt.getwch()
-        else:
-            import termios
-            import tty
-
-            fd = sys.stdin.fileno()
-            saved = termios.tcgetattr(fd)
-            try:
-                tty.setcbreak(fd)
-                termios.tcflush(fd, termios.TCIFLUSH)
-                os.read(fd, 1)
-            finally:
-                termios.tcsetattr(fd, termios.TCSADRAIN, saved)
-    except Exception:
-        # клавиатурный ввод недоступен — пробуем дождаться Enter
-        try:
-            sys.stdin.readline()
-        except Exception:
-            pass
-
-
 async def _main_async(cli: CliOptions) -> int:
     token = CancellationToken()
     _Interrupts(asyncio.get_running_loop(), token).install()
 
     # служебные режимы проверки уведомлений: биржи не подключаются, только MAX Bot API
     if notification_cli.requested(cli):
-        code = await notification_cli.run(cli, token)
-        await asyncio.to_thread(_wait_for_key_press)
-        return code
+        return await notification_cli.run(cli, token)
 
     app = AppRunner(bootstrap.build(cli))
     try:
@@ -105,7 +61,6 @@ async def _main_async(cli: CliOptions) -> int:
             err_console.print(f"Фатальная ошибка: {esc(message_of(ex))}")
             exit_code = 1
 
-        await asyncio.to_thread(_wait_for_key_press)
         return exit_code
     finally:
         await app.aclose()
