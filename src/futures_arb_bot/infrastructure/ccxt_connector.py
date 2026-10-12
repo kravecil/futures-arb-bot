@@ -258,7 +258,8 @@ class CcxtExchangeConnector:
                 return OrderResult.fail(f"рыночный ордер не исполнен (статус: {status or 'unknown'})")
 
             order_id = order.get("id")
-            return OrderResult.ok(str(order_id) if order_id is not None else None, average, filled)
+            fee = fee_in_quote(order, request.symbol, average) if filled > ZERO else None
+            return OrderResult.ok(str(order_id) if order_id is not None else None, average, filled, fee)
         except Exception as ex:
             if _is_cancel(ex):
                 raise
@@ -273,7 +274,9 @@ class CcxtExchangeConnector:
             order = await self._api.fetch_order(order_id, symbol)
             filled_raw = order.get("filled")
             filled = to_dec(filled_raw) if isinstance(filled_raw, (int, float)) and filled_raw > 0 else ZERO
-            return OrderUpdate(order_id, map_status(order.get("status")), filled, _positive(order.get("average")))
+            average = _positive(order.get("average"))
+            fee = fee_in_quote(order, symbol, average) if filled > ZERO else None
+            return OrderUpdate(order_id, map_status(order.get("status")), filled, average, fee)
         except ccxt.OrderNotFound:
             return None
         except Exception as ex:
@@ -394,6 +397,35 @@ def map_status(status: str | None) -> OrderStatus:
             return OrderStatus.REJECTED
         case _:
             return OrderStatus.UNKNOWN
+
+
+def fee_in_quote(order: Mapping[str, Any], symbol: str, average: Decimal | None) -> Decimal | None:
+    """
+    Комиссия заявки из ответа CCXT (поля fee/fees), пересчитанная в валюту расчётов (USDT).
+    Комиссия в базовой монете переводится по средней цене исполнения. Если биржа не сообщила
+    комиссию или списала её в третьей валюте (например, BNB) — None: исполнитель оценит её по taker.
+    Отрицательная комиссия (ребейт мейкеру) учитывается как есть.
+    """
+    entries = order.get("fees") or ([order["fee"]] if order.get("fee") else [])
+    base, _, rest = symbol.partition("/")
+    quote, _, settle = rest.partition(":")
+    total = ZERO
+    found = False
+    for entry in entries:
+        if not isinstance(entry, Mapping):
+            continue
+        cost = entry.get("cost")
+        if not isinstance(cost, (int, float)) or isinstance(cost, bool):
+            continue
+        currency = entry.get("currency")
+        if currency in (quote, settle or quote):
+            total += to_dec(cost)
+        elif currency == base and average is not None:
+            total += to_dec(cost) * average
+        else:
+            return None  # валюта неизвестна или посторонняя — точной суммы в USDT нет
+        found = True
+    return total if found else None
 
 
 def explain_error(ex: BaseException) -> str:

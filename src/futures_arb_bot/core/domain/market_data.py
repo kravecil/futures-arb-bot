@@ -61,6 +61,8 @@ class OrderUpdate:
     status: OrderStatus
     filled_amount: Decimal
     average_price: Decimal | None
+    fee_quote: Decimal | None = None
+    """Накопленная комиссия по заявке в валюте расчётов (USDT); None — биржа не сообщила."""
 
     @property
     def is_dead(self) -> bool:
@@ -94,10 +96,12 @@ class OrderResult:
     average_price: Decimal | None = None
     filled_amount: Decimal = ZERO
     error: str | None = None
+    fee_quote: Decimal | None = None
+    """Комиссия за уже исполненную часть в валюте расчётов (USDT); None — биржа не сообщила."""
 
     @staticmethod
-    def ok(order_id: str | None, average_price: Decimal | None, filled: Decimal) -> OrderResult:
-        return OrderResult(True, order_id, average_price, filled)
+    def ok(order_id: str | None, average_price: Decimal | None, filled: Decimal, fee_quote: Decimal | None = None) -> OrderResult:
+        return OrderResult(True, order_id, average_price, filled, fee_quote=fee_quote)
 
     @staticmethod
     def fail(error: str) -> OrderResult:

@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
 from decimal import Decimal
 
@@ -63,6 +63,14 @@ class _LegState:
     """Исполнение текущей заявки."""
     cost_quote: Decimal = ZERO
     """Σ (объём × цена) по всем исполнениям ноги — для средней цены входа."""
+    taker_percent: Decimal = ZERO
+    """Ставка taker биржи ноги — для оценки комиссии, если биржа не сообщила фактическую."""
+    fee_base: Decimal = ZERO
+    """Комиссии всех снятых/заменённых заявок ноги, USDT."""
+    current_cost: Decimal = ZERO
+    """Σ (объём × цена) по текущей заявке — для оценки её комиссии."""
+    current_fee: Decimal | None = None
+    """Фактическая комиссия текущей заявки, сообщённая биржей (None — неизвестна)."""
     chase_finished: bool = False
     error: str | None = None
     done: bool = False
@@ -71,6 +79,18 @@ class _LegState:
     @property
     def filled(self) -> Decimal:
         return self.filled_base + self.current_filled
+
+    @property
+    def current_order_fee(self) -> Decimal:
+        """Комиссия текущей заявки: фактическая от биржи, иначе оценка по taker."""
+        if self.current_fee is not None:
+            return self.current_fee
+        return self.current_cost * self.taker_percent / HUNDRED
+
+    @property
+    def fee_quote(self) -> Decimal:
+        """Комиссия ноги по всем её заявкам, USDT."""
+        return self.fee_base + self.current_order_fee
 
     @property
     def average_price(self) -> Decimal | None:
@@ -93,7 +113,8 @@ class _CloseLegResult:
     closed: Decimal
     average_price: Decimal | None
     error: str | None = None
-    extra: list[str] = field(default_factory=list)
+    fee_quote: Decimal | None = None
+    """Комиссия закрывающей заявки; None — оценить по taker."""
 
 
 class ArbTradeExecutor:
@@ -363,7 +384,7 @@ class ArbTradeExecutor:
             return False
 
         leg.order_id = result.order_id
-        _record_fill(leg, result.filled_amount, result.average_price)
+        _record_fill(leg, result.filled_amount, result.average_price, result.fee_quote)
         leg.done = leg.filled >= leg.target_amount
         return True
 
@@ -390,7 +411,7 @@ class ArbTradeExecutor:
                         leg.error = "заявка не найдена при опросе"
                     continue
 
-                _record_fill(leg, update.filled_amount, update.average_price)
+                _record_fill(leg, update.filled_amount, update.average_price, update.fee_quote)
                 if update.is_filled:
                     leg.done = True
                 elif update.is_dead:
@@ -446,7 +467,7 @@ class ArbTradeExecutor:
             await leg.connector.cancel_order(leg.order_id, symbol, _NONE)
             final = await leg.connector.fetch_order(leg.order_id, symbol, _NONE)
             if final is not None:
-                _record_fill(leg, final.filled_amount, final.average_price)
+                _record_fill(leg, final.filled_amount, final.average_price, final.fee_quote)
 
             if final is not None and not final.is_dead and not final.is_filled:
                 # заявку снять не удалось — не дублируем её, попробуем на следующем тике
@@ -484,7 +505,7 @@ class ArbTradeExecutor:
             await leg.connector.cancel_order(leg.order_id, symbol, _NONE)
             final = await leg.connector.fetch_order(leg.order_id, symbol, _NONE)
             if final is not None:
-                _record_fill(leg, final.filled_amount, final.average_price)
+                _record_fill(leg, final.filled_amount, final.average_price, final.fee_quote)
 
             if final is not None and not final.is_dead and not final.is_filled:
                 self._log.warning(
@@ -528,11 +549,12 @@ class ArbTradeExecutor:
                             leg,
                             update.filled_amount if update is not None else leg.current_filled,
                             update.average_price if update is not None else None,
+                            update.fee_quote if update is not None else None,
                         )
                         _fold_current_fill(leg)
                         leg.dead = True
                     elif update.is_filled:
-                        _record_fill(leg, update.filled_amount, update.average_price)
+                        _record_fill(leg, update.filled_amount, update.average_price, update.fee_quote)
                         _fold_current_fill(leg)
                         leg.done = True
                     attempt += 1
@@ -627,6 +649,7 @@ class ArbTradeExecutor:
             steps_total=steps,
             steps_left=steps,
             last_quote_at=self._clock.now(),
+            taker_percent=_taker_percent(connector, symbol),
         )
 
     # ------------------------- регистрация позиций -------------------------
@@ -635,7 +658,8 @@ class ArbTradeExecutor:
         """Регистрирует полностью открытую позицию по факту исполнения обеих ног."""
         entry_long = long_leg.average_price if long_leg.average_price is not None else estimate.long_leg.price
         entry_short = short_leg.average_price if short_leg.average_price is not None else estimate.short_leg.price
-        fees = _estimate_fees(long_leg.connector, short_leg.connector, estimate.symbol, entry_long, entry_short, long_leg.filled)
+        # фактические комиссии ног (биржа сообщает их в заявке; где не сообщает — оценка по taker)
+        fees = long_leg.fee_quote + short_leg.fee_quote
 
         position = PositionPair(
             symbol=estimate.symbol,
@@ -658,7 +682,8 @@ class ArbTradeExecutor:
         self._log.success(
             f"Открыт арбитраж {position.symbol}: {formatting.volume(position.matched_size)} × лонг {position.long_exchange_id} "
             f"@ {formatting.price(position.entry_long)} / шорт {position.short_exchange_id} @ {formatting.price(position.entry_short)}, "
-            f"проскальзывание от котировки сигнала: лонг {formatting.pct(slip_long)}, шорт {formatting.pct(slip_short)}"
+            f"проскальзывание от котировки сигнала: лонг {formatting.pct(slip_long)}, шорт {formatting.pct(slip_short)}, "
+            f"комиссия входа {formatting.usd(fees)}"
         )
 
     def _register_partial_position(
@@ -676,9 +701,7 @@ class ArbTradeExecutor:
             short_size=residual_short,
             entry_long=entry_long,
             entry_short=entry_short,
-            fees_entry_usd=_estimate_fees(
-                long_leg.connector, short_leg.connector, estimate.symbol, entry_long, entry_short, max(residual_long, residual_short)
-            ),
+            fees_entry_usd=long_leg.fee_quote + short_leg.fee_quote,
             opened_at=self._clock.now(),
             simulated=False,
         )
@@ -765,7 +788,7 @@ class ArbTradeExecutor:
             await connector.cancel_order(leg.order_id, position.symbol, _NONE)
             update = await connector.fetch_order(leg.order_id, position.symbol, _NONE)
             if update is not None:
-                _record_fill(leg, update.filled_amount, update.average_price)
+                _record_fill(leg, update.filled_amount, update.average_price, update.fee_quote)
 
         cut = min(leg.filled, delta)
         if cut <= ZERO:
@@ -778,7 +801,14 @@ class ArbTradeExecutor:
         else:
             position.short_size = max(ZERO, position.short_size - cut)
 
-        _accrue_closed_leg(position, connector, is_long=cut_long, quantity=cut, exit_price=_first_not_none(leg.average_price, price))
+        _accrue_closed_leg(
+            position,
+            connector,
+            is_long=cut_long,
+            quantity=cut,
+            exit_price=_first_not_none(leg.average_price, price),
+            fee=leg.fee_quote * cut / leg.filled,
+        )
         self._log.success(
             f"{position.symbol}: ребаланс — урезано {which} на {formatting.volume(cut)}, "
             f"ноги {formatting.volume(position.long_size)}/{formatting.volume(position.short_size)}"
@@ -843,14 +873,14 @@ class ArbTradeExecutor:
                 await connector.cancel_order(leg.order_id, position.symbol, _NONE)
                 update = await connector.fetch_order(leg.order_id, position.symbol, _NONE)
                 if update is not None:
-                    _record_fill(leg, update.filled_amount, update.average_price)
+                    _record_fill(leg, update.filled_amount, update.average_price, update.fee_quote)
 
         closed = min(leg.filled, size)
         if closed <= ZERO and policy.type == OrderType.MARKET:
             # исполнение market подтверждается статусом заявки, а при нуле — отсутствием позиции на бирже
             update = await connector.fetch_order(leg.order_id, position.symbol, ct) if leg.order_id is not None else None
             if update is not None:
-                _record_fill(leg, update.filled_amount, update.average_price)
+                _record_fill(leg, update.filled_amount, update.average_price, update.fee_quote)
                 closed = min(leg.filled, size)
 
             if closed <= ZERO and update is not None and update.is_filled:
@@ -864,7 +894,8 @@ class ArbTradeExecutor:
 
                 closed = size  # позиции на бирже нет — нога действительно закрыта
 
-        return _CloseLegResult(closed, leg.average_price, leg.error)
+        # комиссию берём по заявке, если по ней есть исполнение; «закрыто по факту отсутствия позиции» — оценка
+        return _CloseLegResult(closed, leg.average_price, leg.error, leg.fee_quote if leg.filled > ZERO else None)
 
     async def _close(self, position: PositionPair, reason: CloseReason, ct: CancellationToken) -> None:
         """
@@ -906,7 +937,7 @@ class ArbTradeExecutor:
                         return  # позиция остаётся в учёте, закроем позже
 
                     exit_long = _first_not_none(result.average_price, long_ticker.bid if long_ticker is not None else None, position.entry_long)
-                    _accrue_closed_leg(position, long_connector, is_long=True, quantity=result.closed, exit_price=exit_long)
+                    _accrue_closed_leg(position, long_connector, is_long=True, quantity=result.closed, exit_price=exit_long, fee=result.fee_quote)
                     position.long_size = max(ZERO, position.long_size - result.closed)
                     position.exit_long = exit_long
                     position.long_closed = position.long_size <= ZERO
@@ -931,7 +962,7 @@ class ArbTradeExecutor:
                         return
 
                     exit_short = _first_not_none(result.average_price, short_ticker.ask if short_ticker is not None else None, position.entry_short)
-                    _accrue_closed_leg(position, short_connector, is_long=False, quantity=result.closed, exit_price=exit_short)
+                    _accrue_closed_leg(position, short_connector, is_long=False, quantity=result.closed, exit_price=exit_short, fee=result.fee_quote)
                     position.short_size = max(ZERO, position.short_size - result.closed)
                     position.exit_short = exit_short
                     position.short_closed = position.short_size <= ZERO
@@ -1074,20 +1105,30 @@ class ArbTradeExecutor:
 # ------------------------- функции без состояния -------------------------
 
 
-def _record_fill(leg: _LegState, current_order_filled: Decimal, price: Decimal | None) -> None:
-    """Учитывает исполнение текущей заявки: прирост объёма — в итог, цена — в средневзвешенную цену."""
+def _record_fill(leg: _LegState, current_order_filled: Decimal, price: Decimal | None, fee: Decimal | None = None) -> None:
+    """
+    Учитывает исполнение текущей заявки: прирост объёма — в итог, цена — в средневзвешенную цену,
+    комиссия (накопленная по заявке, если биржа её сообщает) — в комиссию ноги.
+    """
+    if fee is not None:
+        leg.current_fee = fee
     delta = current_order_filled - leg.current_filled
     if delta <= ZERO:
         leg.current_filled = max(leg.current_filled, current_order_filled)
         return
+    cost = delta * (price if price is not None else leg.quote_price)
     leg.current_filled += delta
-    leg.cost_quote += delta * (price if price is not None else leg.quote_price)
+    leg.cost_quote += cost
+    leg.current_cost += cost
 
 
 def _fold_current_fill(leg: _LegState) -> None:
     """Переносит исполнение снятой/заменённой заявки в накопленный итог ноги."""
     leg.filled_base += leg.current_filled
+    leg.fee_base += leg.current_order_fee
     leg.current_filled = ZERO
+    leg.current_cost = ZERO
+    leg.current_fee = None
 
 
 def _next_step_bps(leg: _LegState, chase: ChasePlan) -> Decimal:
@@ -1145,15 +1186,20 @@ def _estimate_fees(
     return size * (long_price * _taker_percent(long_connector, symbol) + short_price * _taker_percent(short_connector, symbol)) / HUNDRED
 
 
-def _accrue_closed_leg(position: PositionPair, connector: ExchangeConnector, *, is_long: bool, quantity: Decimal, exit_price: Decimal) -> None:
-    """Начисляет реализованный PnL и комиссию закрытия на урезанный/закрытый фрагмент ноги."""
+def _accrue_closed_leg(
+    position: PositionPair, connector: ExchangeConnector, *, is_long: bool, quantity: Decimal, exit_price: Decimal, fee: Decimal | None = None
+) -> None:
+    """
+    Начисляет реализованный PnL и комиссию закрытия на урезанный/закрытый фрагмент ноги.
+    fee — фактическая комиссия заявки; None — оценка по taker (симуляция, биржа не сообщила).
+    """
     if quantity <= ZERO:
         return
 
     entry = position.entry_long if is_long else position.entry_short
     pnl = quantity * (exit_price - entry if is_long else entry - exit_price)
     position.realized_pnl_usd = (position.realized_pnl_usd if position.realized_pnl_usd is not None else ZERO) + pnl
-    position.fees_exit_usd += quantity * exit_price * _taker_percent(connector, position.symbol) / HUNDRED
+    position.fees_exit_usd += fee if fee is not None else quantity * exit_price * _taker_percent(connector, position.symbol) / HUNDRED
 
     if is_long:
         position.closed_long_volume += quantity
