@@ -116,6 +116,8 @@ class FakeConnector:
         self.streaming_supported = False
         self.subscribed: set[str] = set()
         self.market_data = None
+        self.orders = None
+        self.fetch_calls: list[tuple[str, bool]] = []
 
     @property
     def id(self) -> str:
@@ -195,7 +197,19 @@ class FakeConnector:
             )
         return result
 
-    async def fetch_order(self, order_id: str, symbol: str, ct: CancellationToken | None = None) -> OrderUpdate | None:
+    def update_orders(self, orders) -> None:  # type: ignore[no-untyped-def]
+        self.orders = orders
+
+    def start_order_stream(self, orders) -> bool:  # type: ignore[no-untyped-def]
+        return False
+
+    async def wait_order_update(self, timeout: float) -> bool:
+        if timeout > 0:
+            await asyncio.sleep(timeout)
+        return False
+
+    async def fetch_order(self, order_id: str, symbol: str, ct: CancellationToken | None = None, fresh: bool = False) -> OrderUpdate | None:
+        self.fetch_calls.append((order_id, fresh))
         state = self.order_states.get(order_id)
         if state is None:
             return None

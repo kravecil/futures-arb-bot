@@ -13,6 +13,10 @@ general:
     scan_interval_ms: 100       # WebSocket: как часто пересчитывать спреды по свежим котировкам
     stale_after_ms: 3000        # поток молчит дольше — котировки биржи по REST (раз в refresh_interval_ms)
     volume_refresh_seconds: 60  # обновление оборотов за 24 ч и набора подписок по REST
+  orders:
+    updates: WebSocket          # статусы своих заявок: WebSocket (watch_orders, с проверкой REST) | Rest (опрос)
+    transport: WebSocket        # выставление/отмена: WebSocket (create/cancel_order_ws, где есть в ccxt) | Rest
+    max_cache_age_ms: 1000      # статус из потока без изменений дольше — перепроверка запросом REST
   console_ui:
     refresh_ms: 400             # период перерисовки дашборда
     log_lines: 9                # строк журнала в панели (1..50)

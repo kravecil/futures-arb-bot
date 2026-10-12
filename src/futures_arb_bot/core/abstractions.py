@@ -20,7 +20,7 @@ from futures_arb_bot.core.domain.market_data import (
     TickerSnapshot,
 )
 from futures_arb_bot.core.domain.notifications import NotificationDelivery
-from futures_arb_bot.core.domain.options import BotOptions, ExchangeConfigEntry, MarketDataOptions
+from futures_arb_bot.core.domain.options import BotOptions, ExchangeConfigEntry, MarketDataOptions, OrdersOptions
 from futures_arb_bot.core.domain.statistics import DashboardSnapshot, LogEvent, SessionReport
 
 
@@ -116,7 +116,17 @@ class ExchangeConnector(Protocol):
 
     async def place_order(self, request: OrderRequest, ct: CancellationToken | None = None) -> OrderResult: ...
 
-    async def fetch_order(self, order_id: str, symbol: str, ct: CancellationToken | None = None) -> OrderUpdate | None: ...
+    async def fetch_order(self, order_id: str, symbol: str, ct: CancellationToken | None = None, fresh: bool = False) -> OrderUpdate | None:
+        """Состояние заявки; fresh=True — обязательно запросом к бирже, не из кэша потока заявок."""
+        ...
+
+    async def wait_order_update(self, timeout: float) -> bool:
+        """Подождать события по заявкам из потока (без потока — просто паузу timeout)."""
+        ...
+
+    def update_orders(self, orders: OrdersOptions) -> None: ...
+
+    def start_order_stream(self, orders: OrdersOptions) -> bool: ...
 
     async def fetch_positions(self, ct: CancellationToken | None = None) -> list[PositionSnapshot]: ...
 

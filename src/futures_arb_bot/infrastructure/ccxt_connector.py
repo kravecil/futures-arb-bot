@@ -9,6 +9,7 @@ import asyncio
 import contextlib
 import os
 import time
+import uuid
 from collections.abc import Collection, Mapping
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -30,11 +31,12 @@ from futures_arb_bot.core.domain.market_data import (
     PositionSnapshot,
     TickerSnapshot,
 )
-from futures_arb_bot.core.domain.options import ExchangeConfigEntry, MarketDataOptions
+from futures_arb_bot.core.domain.options import ExchangeConfigEntry, MarketDataOptions, OrdersOptions
 from futures_arb_bot.core.domain.order_execution import ExchangeCapabilityMap, OrderParamsBuilder
 from futures_arb_bot.core.engine.logging_bridge import get_logger
 from futures_arb_bot.core.numbers import HUNDRED, ZERO, dec_str, to_dec
 from futures_arb_bot.infrastructure.ccxt_factory import instantiate
+from futures_arb_bot.infrastructure.order_stream import OrderStream
 from futures_arb_bot.infrastructure.quote_stream import QuoteStream
 
 FUNDING_CACHE_TTL = timedelta(minutes=5)
@@ -72,6 +74,8 @@ class CcxtExchangeConnector:
         self._volume_task: asyncio.Task[None] | None = None
         self._stream_down_logged = False
         self._stream: QuoteStream | None = None
+        self._orders = OrdersOptions()
+        self._order_stream: OrderStream | None = None
 
         config: dict[str, Any] = {"enableRateLimit": True, "timeout": 15000}
 
@@ -96,6 +100,7 @@ class CcxtExchangeConnector:
         self._ccxt_options = ", ".join(f"{k}={_option_text(v)}" for k, v in options.items()) if options else "нет"
         self._api = instantiate(entry.id, config)
         self._stream = QuoteStream(self._api, entry.id, self.display_name, log, clock)
+        self._order_stream = OrderStream(self._api, entry.id, self.display_name, log, lambda order: parse_order_update(order))
 
     # ------------------------- свойства -------------------------
 
@@ -315,7 +320,43 @@ class CcxtExchangeConnector:
 
     # ------------------------- заявки -------------------------
 
+    # ------------------------- заявки: REST и WebSocket -------------------------
+
+    @property
+    def order_stream_running(self) -> bool:
+        return self._order_stream is not None and self._order_stream.running
+
+    @property
+    def supports_order_stream(self) -> bool:
+        return self._order_stream is not None and self._order_stream.supported
+
+    @property
+    def supports_ws_orders(self) -> bool:
+        """Умеет ли биржа выставлять заявки через WebSocket (create_order_ws)."""
+        return bool((getattr(self._api, "has", {}) or {}).get("createOrderWs"))
+
+    def update_orders(self, orders: OrdersOptions) -> None:
+        """Актуальные настройки работы с заявками (перечитываются каждый тик)."""
+        self._orders = orders
+
+    def start_order_stream(self, orders: OrdersOptions) -> bool:
+        """Запустить поток собственных заявок (watch_orders). False — не нужен или биржа не умеет."""
+        self._orders = orders
+        if orders.updates != MarketDataSource.WEBSOCKET or self._order_stream is None:
+            return False
+        return self._order_stream.start()
+
+    async def wait_order_update(self, timeout: float) -> bool:
+        """Подождать события по заявкам из потока (или просто таймаут, если потока нет)."""
+        if self._order_stream is not None and self._orders.updates == MarketDataSource.WEBSOCKET:
+            return await self._order_stream.wait_update(timeout)
+        if timeout > 0:
+            await asyncio.sleep(timeout)
+        return False
+
     async def place_order(self, request: OrderRequest, ct: CancellationToken | None = None) -> OrderResult:
+        client_id: str | None = None
+        use_ws = False
         try:
             _check(ct)
 
@@ -325,6 +366,10 @@ class CcxtExchangeConnector:
 
             # имена и условия параметров биржи (перевод политики заявки) — в OrderParamsBuilder
             parameters = OrderParamsBuilder.build(request, ExchangeCapabilityMap.for_id(self.id))
+            if self.id.lower() in CLIENT_ORDER_ID_EXCHANGES and "clientOrderId" not in parameters:
+                # свой id заявки: по нему находим заявку, если ответ на запрос потерялся в сети
+                client_id = new_client_order_id()
+                parameters["clientOrderId"] = client_id
 
             price: float | None = None
             # ChaseLimit на бирже — это limit: локальное догонание делает исполнитель, нативное — биржа
@@ -335,39 +380,88 @@ class CcxtExchangeConnector:
                 price = float(self._api.price_to_precision(request.symbol, float(request.price)))
 
             side = "buy" if request.side == OrderSide.BUY else "sell"
-            order = await self._api.create_order(request.symbol, order_type, side, amount, price, parameters)
-
-            filled_raw = order.get("filled")
-            filled = to_dec(filled_raw) if isinstance(filled_raw, (int, float)) and filled_raw > 0 else ZERO
-            average = _positive(order.get("average"))
-            if average is None:
-                average = _positive(order.get("price"))
-
-            # рыночный обязан исполниться сразу; лимитный мог ещё не набрать объёма
-            status = order.get("status")
-            if request.type == OrderType.MARKET and status in ("open", "rejected") and filled <= ZERO:
-                return OrderResult.fail(f"рыночный ордер не исполнен (статус: {status or 'unknown'})")
-
-            order_id = order.get("id")
-            fee = fee_in_quote(order, request.symbol, average) if filled > ZERO else None
-            return OrderResult.ok(str(order_id) if order_id is not None else None, average, filled, fee)
+            use_ws = self._orders.transport == MarketDataSource.WEBSOCKET and self.supports_ws_orders
+            create = self._api.create_order_ws if use_ws else self._api.create_order
+            order = await create(request.symbol, order_type, side, amount, price, parameters)
+            return self._order_result(request, order, client_id)
         except Exception as ex:
             if _is_cancel(ex):
                 raise
+            if client_id is not None and isinstance(ex, (ccxt.NetworkError, ccxt.RequestTimeout)):
+                # ответ потерян: заявка могла дойти до биржи — ищем её по нашему clientOrderId
+                found = await self._find_order_by_client_id(request.symbol, client_id)
+                if found is not None:
+                    self._log.warning(
+                        f"[{self.display_name}] ответ на заявку {request.side} {request.symbol} потерян, заявка найдена по clientOrderId"
+                    )
+                    return self._order_result(request, found, client_id)
             message = explain_error(ex)
-            self._log.error(f"[{self.display_name}] ордер {request.side} {request.symbol} × {dec_str(request.amount)}: {message}")
+            via = " (WS)" if use_ws else ""
+            self._log.error(f"[{self.display_name}] ордер{via} {request.side} {request.symbol} × {dec_str(request.amount)}: {message}")
             self._logger.debug("order failed", exc_info=ex)
             return OrderResult.fail(message)
 
-    async def fetch_order(self, order_id: str, symbol: str, ct: CancellationToken | None = None) -> OrderUpdate | None:
+    def _order_result(self, request: OrderRequest, order: Mapping[str, Any], client_id: str | None) -> OrderResult:
+        filled_raw = order.get("filled")
+        filled = to_dec(filled_raw) if isinstance(filled_raw, (int, float)) and filled_raw > 0 else ZERO
+        average = _positive(order.get("average"))
+        if average is None:
+            average = _positive(order.get("price"))
+
+        # рыночный обязан исполниться сразу; лимитный мог ещё не набрать объёма
+        status = order.get("status")
+        if request.type == OrderType.MARKET and status in ("open", "rejected") and filled <= ZERO:
+            return OrderResult.fail(f"рыночный ордер не исполнен (статус: {status or 'unknown'})")
+
+        order_id = order.get("id")
+        fee = fee_in_quote(order, request.symbol, average) if filled > ZERO else None
+        if order_id is not None and self._order_stream is not None:
+            # исходное состояние заявки — в кэш потока: дальше статусы приходят событиями
+            update = parse_order_update(order, request.symbol)
+            if update is not None:
+                self._order_stream.remember(update, client_id)
+        return OrderResult.ok(str(order_id) if order_id is not None else None, average, filled, fee)
+
+    async def _find_order_by_client_id(self, symbol: str, client_id: str) -> Mapping[str, Any] | None:
+        """Заявка с нашим clientOrderId: из потока заявок, иначе среди открытых и недавно закрытых."""
+        stream = self._order_stream
+        if stream is not None and stream.healthy:
+            for _ in range(20):  # до ~2 с ждём события по заявке
+                order_id = stream.find_by_client_id(client_id)
+                if order_id is not None:
+                    with contextlib.suppress(Exception):
+                        return await self._api.fetch_order(order_id, symbol)
+                    break
+                await stream.wait_update(0.1)
+        for method in ("fetch_open_orders", "fetch_closed_orders"):
+            try:
+                orders = await getattr(self._api, method)(symbol, None, 20)
+            except Exception as ex:
+                self._logger.debug(f"{method} при поиске по clientOrderId не удался", exc_info=ex)
+                continue
+            for order in orders or []:
+                cid = str(order.get("clientOrderId") or "")
+                if cid and (cid == client_id or cid.endswith(client_id)):
+                    return order
+        return None
+
+    async def fetch_order(self, order_id: str, symbol: str, ct: CancellationToken | None = None, fresh: bool = False) -> OrderUpdate | None:
+        """
+        Состояние заявки. С потоком заявок — из его кэша (без запроса), если статус обновлялся не позже
+        max_cache_age_ms назад; fresh=True — всегда запрос REST (финальные проверки после отмены).
+        """
+        stream = self._order_stream
+        if not fresh and stream is not None and self._orders.updates == MarketDataSource.WEBSOCKET:
+            cached = stream.get(order_id, self._orders.max_cache_age_ms / 1000)
+            if cached is not None:
+                return cached
         try:
             _check(ct)
             order = await self._api.fetch_order(order_id, symbol)
-            filled_raw = order.get("filled")
-            filled = to_dec(filled_raw) if isinstance(filled_raw, (int, float)) and filled_raw > 0 else ZERO
-            average = _positive(order.get("average"))
-            fee = fee_in_quote(order, symbol, average) if filled > ZERO else None
-            return OrderUpdate(order_id, map_status(order.get("status")), filled, average, fee)
+            update = parse_order_update(order, symbol, order_id)
+            if update is not None and stream is not None:
+                stream.remember(update)
+            return update
         except ccxt.OrderNotFound:
             return None
         except Exception as ex:
@@ -380,6 +474,13 @@ class CcxtExchangeConnector:
     async def cancel_order(self, order_id: str, symbol: str, ct: CancellationToken | None = None) -> bool:
         try:
             _check(ct)
+            if self._orders.transport == MarketDataSource.WEBSOCKET and (getattr(self._api, "has", {}) or {}).get("cancelOrderWs"):
+                try:
+                    await self._api.cancel_order_ws(order_id, symbol)
+                    return True
+                except ccxt.NetworkError as ex:
+                    # отмена идемпотентна — при сбое соединения повторяем по REST
+                    self._logger.debug("cancel_order_ws failed, retry via REST", exc_info=ex)
             await self._api.cancel_order(order_id, symbol)
             return True
         except Exception as ex:
@@ -387,6 +488,9 @@ class CcxtExchangeConnector:
                 raise
             self._logger.debug(f"CancelOrder {order_id} {symbol} failed", exc_info=ex)
             return False
+        finally:
+            if self._order_stream is not None:
+                self._order_stream.forget(order_id)  # после отмены — только свежие данные
 
     async def fetch_positions(self, ct: CancellationToken | None = None) -> list[PositionSnapshot]:
         # исключения не глотаем: вызывающий код сам решает, что делать при недоступности сверки
@@ -474,10 +578,34 @@ class CcxtExchangeConnector:
                 await self._volume_task
         if self._stream is not None:
             await self._stream.aclose()
+        if self._order_stream is not None:
+            await self._order_stream.aclose()
         await self._api.close()
 
 
 # ------------------------- вспомогательное -------------------------
+
+
+CLIENT_ORDER_ID_EXCHANGES = frozenset({"okx", "gate", "bybit", "binanceusdm", "binance", "bitget", "kucoinfutures", "bingx"})
+"""Биржи, где единый параметр ccxt clientOrderId проверенно поддерживается."""
+
+
+def new_client_order_id() -> str:
+    """Свой id заявки: латиница и цифры, 23 символа — в пределах ограничений всех бирж списка."""
+    return "arb" + uuid.uuid4().hex[:20]
+
+
+def parse_order_update(order: Mapping[str, Any], symbol: str | None = None, order_id: str | None = None) -> OrderUpdate | None:
+    """Заявка ccxt (ответ REST/WS или событие потока) → OrderUpdate."""
+    oid = order.get("id") if order_id is None else order_id
+    if oid is None:
+        return None
+    sym = symbol or order.get("symbol") or ""
+    filled_raw = order.get("filled")
+    filled = to_dec(filled_raw) if isinstance(filled_raw, (int, float)) and filled_raw > 0 else ZERO
+    average = _positive(order.get("average"))
+    fee = fee_in_quote(order, sym, average) if filled > ZERO and sym else None
+    return OrderUpdate(str(oid), map_status(order.get("status")), filled, average, fee)
 
 
 def map_status(status: str | None) -> OrderStatus:

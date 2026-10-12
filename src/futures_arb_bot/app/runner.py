@@ -18,7 +18,7 @@ from futures_arb_bot.app.ui.report import SessionReportPrinter
 from futures_arb_bot.app.ui.views import opportunities_table
 from futures_arb_bot.core.abstractions import ExchangeConnector
 from futures_arb_bot.core.cancellation import CancellationToken, OperationCanceledError
-from futures_arb_bot.core.domain.enums import CloseReason, NetworkMode, TimeInForce
+from futures_arb_bot.core.domain.enums import CloseReason, MarketDataSource, NetworkMode, TimeInForce
 from futures_arb_bot.core.domain.options import BotOptions, NotificationOptions
 from futures_arb_bot.core.domain.order_config_validator import OrderConfigValidator
 from futures_arb_bot.core.domain.order_execution import ExchangeCapabilityMap, OrderPolicy, OrderPolicyResolver
@@ -66,6 +66,8 @@ class AppRunner:
 
         if not await self._check_trading_access(connectors, ct):
             return 2
+
+        self._start_order_streams(connectors)
 
         options = self._config.current
         trading = "ВКЛЮЧЕНА" if options.arbitrage.enabled else "выключена (мониторинг)"
@@ -212,6 +214,21 @@ class AppRunner:
             console.print(f"[green]✓[/] {esc(connector.display_name)}: доступ подтверждён")
 
         return True
+
+    def _start_order_streams(self, connectors: list[ExchangeConnector]) -> None:
+        """Потоки собственных заявок (watch_orders) — только когда робот реально торгует."""
+        options = self._config.current
+        if options.general.network_mode == NetworkMode.DRY_RUN or not options.arbitrage.enabled:
+            return
+        orders = options.general.orders
+        for connector in connectors:
+            connector.update_orders(orders)
+            if orders.updates != MarketDataSource.WEBSOCKET:
+                continue
+            if connector.start_order_stream(orders):
+                console.print(f"[green]✓[/] {esc(connector.display_name)}: статусы заявок — поток WebSocket")
+            else:
+                console.print(f"[yellow]![/] {esc(connector.display_name)}: потока заявок в ccxt нет — статусы опросом REST")
 
     async def _shutdown(self) -> None:
         options = self._config.current

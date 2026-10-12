@@ -74,6 +74,17 @@ class MarketDataOptions(ConfigModel):
     """Как часто обновлять по REST обороты за 24 ч (в потоках лучших цен их нет) и набор подписок."""
 
 
+class OrdersOptions(ConfigModel):
+    """Работа с заявками на бирже (appsettings.yaml → general.orders); в DryRun не используется."""
+
+    updates: MarketDataSource = MarketDataSource.WEBSOCKET
+    """Статусы заявок: WebSocket — события потока watch_orders (опрос REST — страховка); Rest — только опрос."""
+    transport: MarketDataSource = MarketDataSource.WEBSOCKET
+    """Выставление и отмена заявок: WebSocket — create/cancel_order_ws, где биржа умеет (иначе REST); Rest — только REST."""
+    max_cache_age_ms: int = 1_000
+    """Статус из потока без изменений дольше этого — перепроверяется запросом REST (страховка от «тихого» обрыва)."""
+
+
 class GeneralOptions(ConfigModel):
     """Общие настройки приложения (appsettings.yaml → general)."""
 
@@ -82,6 +93,7 @@ class GeneralOptions(ConfigModel):
     write_log_file: bool = True
     console_ui: UiOptions = Field(default_factory=UiOptions)
     market_data: MarketDataOptions = Field(default_factory=MarketDataOptions)
+    orders: OrdersOptions = Field(default_factory=OrdersOptions)
 
 
 class ChaseOptions(ConfigModel):

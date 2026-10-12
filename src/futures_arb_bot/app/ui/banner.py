@@ -54,6 +54,11 @@ def print_banner(config: ConfigProvider) -> None:
     else:
         quotes = f"REST [bright_black](опрос раз в {options.general.refresh_interval_ms} мс)[/]"
     grid.add_row("[bright_black]Котировки:[/]", quotes)
+    if options.general.network_mode != NetworkMode.DRY_RUN and arbitrage.enabled:
+        orders = options.general.orders
+        updates = "поток WebSocket" if orders.updates == MarketDataSource.WEBSOCKET else "опрос REST"
+        transport = "WebSocket, где биржа умеет" if orders.transport == MarketDataSource.WEBSOCKET else "REST"
+        grid.add_row("[bright_black]Заявки:[/]", f"статусы — {updates}, выставление и отмена — {transport}")
     grid.add_row("[bright_black]Конфигурация:[/]", esc(config.config_directory))
 
     console.print(grid)

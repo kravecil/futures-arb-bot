@@ -113,6 +113,7 @@ class DefaultArbitrageScanner:
         tick_started = time.monotonic()
         for connector in self._registry.connectors:
             connector.update_market_data(options.general.market_data, options.general.refresh_interval_ms)
+            connector.update_orders(options.general.orders)
         fetched = await self._fetch_all(ct)
         self._update_subscriptions(options)
         total_fetched = sum(len(result.tickers) for _, result in fetched)

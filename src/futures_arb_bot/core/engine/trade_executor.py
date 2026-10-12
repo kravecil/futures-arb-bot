@@ -13,7 +13,7 @@ from datetime import datetime, timedelta
 from decimal import Decimal
 
 from futures_arb_bot.core.abstractions import ConfigProvider, EventLog, ExchangeConnector, StatisticsCollector
-from futures_arb_bot.core.cancellation import CancellationToken, OperationCanceledError, delay
+from futures_arb_bot.core.cancellation import CancellationToken, OperationCanceledError
 from futures_arb_bot.core.clock import Clock
 from futures_arb_bot.core.domain.arbitrage import PositionPair, SpreadEstimate
 from futures_arb_bot.core.domain.enums import CloseReason, NetworkMode, OrderSide, OrderType, PositionStatus, TimeInForce
@@ -270,7 +270,7 @@ class ArbTradeExecutor:
             return
 
         for stray in list(self._stray_orders):
-            update = await stray.connector.fetch_order(stray.order_id, stray.symbol, ct)
+            update = await stray.connector.fetch_order(stray.order_id, stray.symbol, ct, fresh=True)
             if update is None or update.is_dead:
                 self._remove_stray(stray)
                 self._log.warning(f"[{stray.connector.display_name}] «потерянная» заявка {stray.symbol} {stray.side} больше не живёт на бирже")
@@ -454,9 +454,28 @@ class ArbTradeExecutor:
                 break
 
             try:
-                await delay(options.order_poll_interval_ms / 1000, ct)
+                await self._wait_for_order_events(legs, options.order_poll_interval_ms / 1000, ct)
             except OperationCanceledError:
                 pass  # следующий виток зафиксирует остановку и выйдет из ожидания
+
+    async def _wait_for_order_events(self, legs: list[_LegState], seconds: float, ct: CancellationToken) -> None:
+        """
+        Пауза между проверками ног: до seconds, но с потоком заявок — до первого события по ним
+        (исполнение замечается сразу, а не на следующем опросе). Прерывается остановкой робота.
+        """
+        ct.throw_if_cancellation_requested()
+        connectors = list({id(leg.connector): leg.connector for leg in legs if not leg.done and not leg.dead}.values())
+        if not connectors:
+            return
+        waiters = [asyncio.ensure_future(c.wait_order_update(seconds)) for c in connectors]
+        stop = asyncio.ensure_future(ct.wait()) if ct is not _NONE else None
+        try:
+            pending = {*waiters, stop} if stop is not None else set(waiters)
+            await asyncio.wait(pending, timeout=seconds + 0.05, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            for task in (*waiters, *([stop] if stop is not None else [])):
+                task.cancel()
+        ct.throw_if_cancellation_requested()
 
     # ------------------------- догонание цены -------------------------
 
@@ -491,7 +510,7 @@ class ArbTradeExecutor:
         if leg.order_id is not None:
             # отмена идёт без токена: снять заявку важнее, чем выйти из процесса
             await leg.connector.cancel_order(leg.order_id, symbol, _NONE)
-            final = await leg.connector.fetch_order(leg.order_id, symbol, _NONE)
+            final = await leg.connector.fetch_order(leg.order_id, symbol, _NONE, fresh=True)
             if final is not None:
                 _record_fill(leg, final.filled_amount, final.average_price, final.fee_quote)
 
@@ -529,7 +548,7 @@ class ArbTradeExecutor:
 
         if leg.order_id is not None and not leg.dead:
             await leg.connector.cancel_order(leg.order_id, symbol, _NONE)
-            final = await leg.connector.fetch_order(leg.order_id, symbol, _NONE)
+            final = await leg.connector.fetch_order(leg.order_id, symbol, _NONE, fresh=True)
             if final is not None:
                 _record_fill(leg, final.filled_amount, final.average_price, final.fee_quote)
 
@@ -569,7 +588,7 @@ class ArbTradeExecutor:
                 attempt = 0
                 while attempt < 3 and not leg.dead:
                     await leg.connector.cancel_order(leg.order_id, leg.request.symbol, _NONE)
-                    update = await leg.connector.fetch_order(leg.order_id, leg.request.symbol, _NONE)
+                    update = await leg.connector.fetch_order(leg.order_id, leg.request.symbol, _NONE, fresh=True)
                     if update is None or update.is_dead:
                         _record_fill(
                             leg,
@@ -813,7 +832,7 @@ class ArbTradeExecutor:
         # по таймауту снимаем заявку и перечитываем финальное исполнение (гонка отмены и исполнения)
         if not leg.done and not leg.dead and leg.order_id is not None:
             await connector.cancel_order(leg.order_id, position.symbol, _NONE)
-            update = await connector.fetch_order(leg.order_id, position.symbol, _NONE)
+            update = await connector.fetch_order(leg.order_id, position.symbol, _NONE, fresh=True)
             if update is not None:
                 _record_fill(leg, update.filled_amount, update.average_price, update.fee_quote)
 
@@ -899,14 +918,14 @@ class ArbTradeExecutor:
 
             if not leg.done and not leg.dead and leg.order_id is not None:
                 await connector.cancel_order(leg.order_id, position.symbol, _NONE)
-                update = await connector.fetch_order(leg.order_id, position.symbol, _NONE)
+                update = await connector.fetch_order(leg.order_id, position.symbol, _NONE, fresh=True)
                 if update is not None:
                     _record_fill(leg, update.filled_amount, update.average_price, update.fee_quote)
 
         closed = min(leg.filled, size)
         if closed <= ZERO and policy.type == OrderType.MARKET:
             # исполнение market подтверждается статусом заявки, а при нуле — отсутствием позиции на бирже
-            update = await connector.fetch_order(leg.order_id, position.symbol, _NONE) if leg.order_id is not None else None
+            update = await connector.fetch_order(leg.order_id, position.symbol, _NONE, fresh=True) if leg.order_id is not None else None
             if update is not None:
                 _record_fill(leg, update.filled_amount, update.average_price, update.fee_quote)
                 closed = min(leg.filled, size)
