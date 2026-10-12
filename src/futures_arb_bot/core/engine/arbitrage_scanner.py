@@ -67,6 +67,7 @@ class DefaultArbitrageScanner:
         self._last_signal_log: dict[str, datetime] = {}
         self._last_funding_skip_log: dict[str, datetime] = {}
         self._snapshot: DashboardSnapshot | None = None
+        self._last_tick_ms: float | None = None
         self._prepared = False
 
     @property
@@ -100,13 +101,18 @@ class DefaultArbitrageScanner:
     async def scan_once(self, ct: CancellationToken) -> None:
         self._ensure_prepared()
         options = self._config.current
+        tick_started = time.monotonic()
         fetched = await self._fetch_all(ct)
         total_fetched = sum(len(result.tickers) for _, result in fetched)
         funding = await self._fetch_funding(ct)
 
         estimates, tracked_symbols = self._evaluate(fetched, funding, options)
+        tick_ms = (time.monotonic() - tick_started) * 1000
 
         self._stats.record_scan_tick(total_fetched)
+        self._stats.record_tick_duration(tick_ms)
+        self._last_tick_ms = tick_ms
+        self._log.debug(f"[scan] тик {tick_ms:.0f} мс")
         for estimate in estimates:
             self._stats.record_opportunity(estimate)
 
@@ -125,6 +131,13 @@ class DefaultArbitrageScanner:
                 self._log_funding_skip(candidate, limit)
                 continue
             candidates.append(candidate)
+
+        # возраст котировок в момент решения: сколько прошло с самой старой котировки сигнала
+        decided_at = self._clock.now()
+        for candidate in candidates:
+            age = _quote_age_ms(candidate, decided_at)
+            if age is not None:
+                self._stats.record_quote_age(age)
 
         self._log_signals(candidates)
         self._notify_signals(candidates)
@@ -260,6 +273,12 @@ class DefaultArbitrageScanner:
                     short_leg=replace(estimate.short_leg, funding_percent=short_funding),
                 )
 
+            estimate = replace(
+                estimate,
+                long_leg=replace(estimate.long_leg, quoted_at=cheaper.timestamp),
+                short_leg=replace(estimate.short_leg, quoted_at=richer.timestamp),
+            )
+
             estimates.append(estimate)
 
         estimates.sort(key=lambda e: e.net_percent, reverse=True)
@@ -298,6 +317,7 @@ class DefaultArbitrageScanner:
             self._log.success(
                 f"Сигнал {c.symbol}: лонг {c.long_leg.exchange_id} @ {formatting.price(c.long_leg.price)} → "
                 f"шорт {c.short_leg.exchange_id} @ {formatting.price(c.short_leg.price)}, нетто {formatting.pct(c.net_percent)}"
+                f"{_ages_text(c, now)}"
             )
 
     def _notify_signals(self, candidates: list[SpreadEstimate]) -> None:
@@ -306,6 +326,25 @@ class DefaultArbitrageScanner:
             return
         for candidate in candidates:
             self._notifier.notify(candidate)
+
+
+def _leg_age_ms(quoted_at: datetime | None, now: datetime) -> float | None:
+    return max(0.0, (now - quoted_at).total_seconds() * 1000) if quoted_at is not None else None
+
+
+def _quote_age_ms(candidate: SpreadEstimate, now: datetime) -> float | None:
+    """Возраст самой старой из двух котировок сигнала, мс."""
+    ages = [a for a in (_leg_age_ms(candidate.long_leg.quoted_at, now), _leg_age_ms(candidate.short_leg.quoted_at, now)) if a is not None]
+    return max(ages) if ages else None
+
+
+def _ages_text(candidate: SpreadEstimate, now: datetime) -> str:
+    long_age = _leg_age_ms(candidate.long_leg.quoted_at, now)
+    short_age = _leg_age_ms(candidate.short_leg.quoted_at, now)
+    if long_age is None and short_age is None:
+        return ""
+    fmt = lambda a: "н/д" if a is None else f"{a:.0f}"  # noqa: E731
+    return f", возраст котировок {fmt(long_age)}/{fmt(short_age)} мс"
 
 
 def _reraise_first(results: list[object]) -> None:

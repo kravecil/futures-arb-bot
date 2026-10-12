@@ -11,7 +11,7 @@ from futures_arb_bot.core.clock import Clock
 from futures_arb_bot.core.domain.arbitrage import PositionPair, SpreadEstimate
 from futures_arb_bot.core.domain.enums import CloseReason, NetworkMode
 from futures_arb_bot.core.domain.market_data import ExchangeFees
-from futures_arb_bot.core.domain.statistics import ClosedPositionRecord, DashboardSnapshot, ExchangeRuntimeStat, SessionReport
+from futures_arb_bot.core.domain.statistics import ClosedPositionRecord, DashboardSnapshot, ExchangeRuntimeStat, LatencyStats, SessionReport
 from futures_arb_bot.core.numbers import ZERO
 
 
@@ -45,10 +45,42 @@ class DefaultStatisticsCollector:
         self._closed: list[ClosedPositionRecord] = []
         self._open: list[PositionPair] = []
         self._best_ever: SpreadEstimate | None = None
+        self._tick_count = 0
+        self._tick_sum_ms = 0.0
+        self._tick_max_ms = 0.0
+        self._last_tick_ms: float | None = None
+        self._age_count = 0
+        self._age_sum_ms = 0.0
+        self._age_max_ms = 0.0
 
     def record_scan_tick(self, tickers_fetched: int) -> None:
         self._scan_ticks += 1
         self._tickers_processed += tickers_fetched
+
+    def record_tick_duration(self, duration_ms: float) -> None:
+        """Длительность тика: получение котировок со всех бирж и расчёт спредов."""
+        self._tick_count += 1
+        self._tick_sum_ms += duration_ms
+        self._tick_max_ms = max(self._tick_max_ms, duration_ms)
+        self._last_tick_ms = duration_ms
+
+    def record_quote_age(self, age_ms: float) -> None:
+        """Возраст самой старой котировки сигнала в момент решения."""
+        self._age_count += 1
+        self._age_sum_ms += age_ms
+        self._age_max_ms = max(self._age_max_ms, age_ms)
+
+    def latency(self) -> LatencyStats | None:
+        if self._tick_count == 0:
+            return None
+        return LatencyStats(
+            ticks=self._tick_count,
+            avg_tick_ms=self._tick_sum_ms / self._tick_count,
+            max_tick_ms=self._tick_max_ms,
+            signals=self._age_count,
+            avg_quote_age_ms=self._age_sum_ms / self._age_count if self._age_count else None,
+            max_quote_age_ms=self._age_max_ms if self._age_count else None,
+        )
 
     def record_opportunity(self, estimate: SpreadEstimate) -> None:
         self._opportunities += 1
@@ -124,6 +156,7 @@ class DefaultStatisticsCollector:
             exchanges=exchanges,
             top_symbols=top_symbols,
             trading_was_enabled=self._config.current.arbitrage.enabled,
+            latency=self.latency(),
         )
 
     def build_dashboard(self, top: list[SpreadEstimate], online_exchanges: int, tracked_symbols: int) -> DashboardSnapshot:
@@ -143,6 +176,8 @@ class DefaultStatisticsCollector:
             realized_pnl_usd=sum((p.pnl_usd for p in self._closed), ZERO),
             pnl_simulated=options.general.network_mode == NetworkMode.DRY_RUN,
             trading_enabled=options.arbitrage.enabled,
+            last_tick_ms=self._last_tick_ms,
+            avg_quote_age_ms=self._age_sum_ms / self._age_count if self._age_count else None,
         )
 
     def _accumulator(self, exchange_id: str) -> _ExchangeAccumulator:

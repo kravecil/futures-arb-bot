@@ -59,6 +59,15 @@ class SessionReportPrinter:
             if best is None
             else f"{esc(best.symbol)} · {formatting.pct(best.net_percent)} ({esc(best.long_leg.exchange_id)} → {esc(best.short_leg.exchange_id)})",
         )
+        latency = report.latency
+        if latency is not None:
+            table.add_row("[cyan]Тик: котировки + расчёт[/]", f"в среднем {latency.avg_tick_ms:.0f} мс, максимум {latency.max_tick_ms:.0f} мс")
+            ages = (
+                "—"
+                if latency.avg_quote_age_ms is None or latency.max_quote_age_ms is None
+                else f"в среднем {latency.avg_quote_age_ms:.0f} мс, максимум {latency.max_quote_age_ms:.0f} мс ({format_n0(latency.signals)} сигн.)"
+            )
+            table.add_row("[cyan]Возраст котировок в сигналах[/]", ages)
         table.add_row("[cyan]Ордеров открыто / ошибок[/]", f"{report.orders_opened} / {report.orders_failed}")
         table.add_row("[cyan]Позиций открыто / закрыто[/]", f"{report.orders_opened} / {len(report.closed_positions)}")
 

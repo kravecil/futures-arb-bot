@@ -219,3 +219,19 @@ async def test_legs_within_skew_limit_still_make_a_signal():
     await h.scanner.scan_once(NONE)
 
     assert len(h.executor.processed) == 1
+
+
+async def test_quote_age_of_signal_is_measured():
+    h = await create()
+    # котировка дешёвой биржи снята на 2 с раньше «сейчас», дорогой — в «сейчас»
+    h.long.tickers = {SYMBOL: ticker("binanceusdm", SYMBOL, bid=D("99.9"), ask=D(100), ts=NOW - timedelta(seconds=2))}
+
+    await h.scanner.scan_once(NONE)
+
+    [candidate] = h.executor.processed
+    assert candidate.long_leg.quoted_at == NOW - timedelta(seconds=2)
+    assert candidate.short_leg.quoted_at == NOW
+    snapshot = h.scanner.snapshot
+    assert snapshot is not None and snapshot.last_tick_ms is not None
+    latency = h.scanner._stats.snapshot(NOW).latency
+    assert latency is not None and latency.max_quote_age_ms == 2000

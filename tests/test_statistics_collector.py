@@ -78,3 +78,22 @@ def test_dashboard_reflects_state():
     dashboard = stats.build_dashboard([], 2, 42)
     assert dashboard.open_positions == 0
     assert dashboard.realized_pnl_usd == D("0.3")
+
+
+def test_latency_is_aggregated_for_report_and_dashboard():
+    stats = DefaultStatisticsCollector(FakeConfigProvider(), FixedClock(NOW))
+    assert stats.snapshot(NOW).latency is None
+
+    stats.record_tick_duration(100)
+    stats.record_tick_duration(300)
+    stats.record_quote_age(50)
+    stats.record_quote_age(150)
+
+    latency = stats.snapshot(NOW).latency
+    assert latency is not None
+    assert (latency.ticks, latency.avg_tick_ms, latency.max_tick_ms) == (2, 200, 300)
+    assert (latency.signals, latency.avg_quote_age_ms, latency.max_quote_age_ms) == (2, 100, 150)
+
+    dashboard = stats.build_dashboard([], 2, 0)
+    assert dashboard.last_tick_ms == 300
+    assert dashboard.avg_quote_age_ms == 100

@@ -51,6 +51,18 @@ class ClosedPositionRecord:
 
 
 @dataclass(frozen=True, slots=True)
+class LatencyStats:
+    """Замеры скорости реакции за сеанс (мс)."""
+
+    ticks: int
+    avg_tick_ms: float
+    max_tick_ms: float
+    signals: int
+    avg_quote_age_ms: float | None
+    max_quote_age_ms: float | None
+
+
+@dataclass(frozen=True, slots=True)
 class DashboardSnapshot:
     """Снимок состояния для дашборда (обновляется каждый тик сканера)."""
 
@@ -67,6 +79,10 @@ class DashboardSnapshot:
     realized_pnl_usd: Decimal
     pnl_simulated: bool
     trading_enabled: bool
+    last_tick_ms: float | None = None
+    """Длительность последнего тика: получение котировок + расчёт спредов."""
+    avg_quote_age_ms: float | None = None
+    """Средний возраст котировок в сигналах за сеанс (сколько им было в момент решения)."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -87,6 +103,7 @@ class SessionReport:
     exchanges: list[ExchangeRuntimeStat]
     top_symbols: list[tuple[str, int]]
     trading_was_enabled: bool
+    latency: LatencyStats | None = None
 
     @property
     def duration(self) -> timedelta:

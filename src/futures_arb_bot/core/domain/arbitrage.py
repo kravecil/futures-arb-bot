@@ -19,6 +19,8 @@ class OpportunityLeg:
     price: Decimal
     fee_percent: Decimal
     funding_percent: Decimal | None = None
+    quoted_at: datetime | None = None
+    """Время котировки ноги (биржевое, а если биржа его не дала — время получения)."""
 
 
 @dataclass(frozen=True, slots=True)

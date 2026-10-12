@@ -137,6 +137,8 @@ class Dashboard:
                 f"сигналов [{WHITE}]{snapshot.opportunities}[/]",
                 f"позиций [{WHITE}]{snapshot.open_positions}[/]",
                 f"ошибок [{WHITE}]{snapshot.errors}[/]",
+                f"тик [{WHITE}]{snapshot.last_tick_ms:.0f}[/] мс" if snapshot.last_tick_ms is not None else None,
+                f"котировки [{WHITE}]{snapshot.avg_quote_age_ms:.0f}[/] мс" if snapshot.avg_quote_age_ms is not None else None,
                 "[dim]Ctrl+C — остановка и отчёт[/]",
             ],
         )
