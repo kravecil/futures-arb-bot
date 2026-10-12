@@ -141,6 +141,24 @@ uv run futures-arb-bot --config-dir /путь/к/config
 
 Ключи API для мониторинга **не нужны** — тикеры это публичные данные. Ключи понадобятся, только когда включите торговлю.
 
+### Сервер (Linux VPS)
+
+Одна команда под `root` ставит git, tmux и uv (Python 3.14 uv скачает сам), клонирует репозиторий в `~/futures-arb-bot`, ставит зависимости, создаёт `.env` и регистрирует службу systemd:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/kravecil/futures-arb-bot/main/scripts/setup-server.sh | bash
+```
+
+Прежний каталог `~/futures-arb-bot` без git (сборка версии на C#) скрипт переносит в `~/futures-arb-bot.old-<дата>`, а ключи бирж и токен MAX из его `config/*.json` переносит в новый `.env`. Повторный запуск той же команды обновляет код и зависимости, `.env` не трогает.
+
+```bash
+cd ~/futures-arb-bot && uv run futures-arb-bot --once      # пробный скан
+tmux new -s arb "cd ~/futures-arb-bot && uv run futures-arb-bot"   # дашборд; Ctrl+B, D — отключиться
+systemctl enable --now futures-arb-bot                      # или службой: --no-ui, автоперезапуск
+journalctl -u futures-arb-bot -f                            # журнал службы
+systemctl stop futures-arb-bot                              # остановка = Ctrl+C: закрытие позиций и отчёт
+```
+
 ### Docker
 
 ```bash
