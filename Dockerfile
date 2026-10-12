@@ -1,22 +1,19 @@
-# ---- Сборка ----
-FROM mcr.microsoft.com/dotnet/sdk:10.0 AS build
-WORKDIR /src
+# ---- Сборка окружения ----
+FROM ghcr.io/astral-sh/uv:python3.14-bookworm-slim AS build
+ENV UV_COMPILE_BYTECODE=1 UV_LINK_MODE=copy UV_PYTHON_DOWNLOADS=never
+WORKDIR /app
 
-COPY Directory.Build.props Directory.Packages.props global.json ./
-COPY FuturesArbBot.slnx ./
-COPY src/FuturesArbBot.Core/FuturesArbBot.Core.csproj            src/FuturesArbBot.Core/
-COPY src/FuturesArbBot.Infrastructure/FuturesArbBot.Infrastructure.csproj src/FuturesArbBot.Infrastructure/
-COPY src/FuturesArbBot.App/FuturesArbBot.App.csproj              src/FuturesArbBot.App/
-COPY tests/FuturesArbBot.Tests/FuturesArbBot.Tests.csproj        tests/FuturesArbBot.Tests/
-RUN dotnet restore
+COPY pyproject.toml uv.lock README.md LICENSE ./
+RUN uv sync --locked --no-dev --no-install-project
 
-COPY . .
-RUN dotnet publish src/FuturesArbBot.App -c Release -o /app --no-restore
+COPY src/ ./src/
+RUN uv sync --locked --no-dev
 
 # ---- Рантайм ----
-FROM mcr.microsoft.com/dotnet/runtime:10.0
+FROM python:3.14-slim-bookworm
 WORKDIR /app
-COPY --from=build /app .
+COPY --from=build /app /app
 COPY config/ /app/config/
+ENV PATH="/app/.venv/bin:$PATH" PYTHONUNBUFFERED=1
 
-ENTRYPOINT ["dotnet", "FuturesArbBot.dll"]
+ENTRYPOINT ["futures-arb-bot"]

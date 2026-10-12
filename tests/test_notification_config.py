@@ -11,6 +11,7 @@ import pytest
 
 from futures_arb_bot.core.domain.enums import MaxSendEndpoint, NetworkMode
 from futures_arb_bot.core.domain.options import DEFAULT_MAX_BASE_URL, NotificationOptions
+from futures_arb_bot.infrastructure import config as config_module
 from futures_arb_bot.infrastructure.config import ConfigError, YamlConfigProvider, resolve_config_directory
 
 from .fakes import D
@@ -115,7 +116,8 @@ def test_environment_overrides_nested_and_list_values(tmp_path):
     assert options.exchanges.items[1].taker_fee_percent == D("0.07")
 
 
-def test_changed_file_is_reloaded_and_broken_file_keeps_last_good_version(tmp_path):
+def test_changed_file_is_reloaded_and_broken_file_keeps_last_good_version(tmp_path, monkeypatch):
+    monkeypatch.setattr(config_module, "RELOAD_CHECK_SECONDS", 0.0)
     write_files(tmp_path, None)
     provider = YamlConfigProvider(str(tmp_path), {})
     assert provider.current.arbitrage.min_spread_percent_up == D("0.5")

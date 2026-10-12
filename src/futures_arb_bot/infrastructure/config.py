@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import os
 import threading
+import time
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
@@ -26,6 +27,8 @@ OPTIONAL_FILES = ("notifications.yaml",)
 """Файлы, которых может не быть: разделы берутся из значений по умолчанию."""
 
 ENV_PREFIX = "ARB_"
+RELOAD_CHECK_SECONDS = 1.0
+"""Как часто проверять, не изменились ли файлы конфигурации."""
 _PROJECT_ROOT = Path(__file__).resolve().parents[3]
 
 
@@ -150,6 +153,7 @@ class YamlConfigProvider:
         self._gate = threading.Lock()
         self._stamp: tuple[tuple[str, float | None], ...] | None = None
         self._current = self._load()
+        self._next_check = time.monotonic() + RELOAD_CHECK_SECONDS
 
     @property
     def config_directory(self) -> str:
@@ -157,6 +161,12 @@ class YamlConfigProvider:
 
     @property
     def current(self) -> BotOptions:
+        # файлы проверяются не чаще раза в RELOAD_CHECK_SECONDS: настройки читаются очень часто
+        now = time.monotonic()
+        if now < self._next_check:
+            return self._current
+        self._next_check = now + RELOAD_CHECK_SECONDS
+
         stamp = self._make_stamp()
         if stamp != self._stamp:
             with self._gate:
