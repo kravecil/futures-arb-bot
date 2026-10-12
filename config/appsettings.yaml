@@ -6,7 +6,7 @@
 
 general:
   network_mode: live            # DryRun | Testnet | Live
-  refresh_interval_ms: 500      # не меньше 500 мс
+  refresh_interval_ms: 500      # период цикла сканирования, мс (не меньше 500)
   write_log_file: true          # журнал сеанса в logs/session-*.log
   console_ui:
     refresh_ms: 400             # период перерисовки дашборда

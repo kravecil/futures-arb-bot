@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from collections.abc import Mapping
 from dataclasses import replace
 from datetime import datetime, timedelta
@@ -78,8 +79,12 @@ class DefaultArbitrageScanner:
         self._log.info(f"Сканер запущен: бирж {len(self._connectors)}, пар после фильтра {total}")
 
         while not ct.is_cancellation_requested:
+            started = time.monotonic()
             try:
                 await self.scan_once(ct)
+                # тики не чаще refresh_interval_ms: опрос занимает часть интервала, ждём только остаток
+                interval = self._config.current.general.refresh_interval_ms / 1000
+                await delay(interval - (time.monotonic() - started), ct)
             except Exception as ex:
                 if isinstance(ex, OperationCanceledError) and ct.is_cancellation_requested:
                     break
