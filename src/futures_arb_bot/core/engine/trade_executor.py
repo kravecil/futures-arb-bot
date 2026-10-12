@@ -166,6 +166,8 @@ class ArbTradeExecutor:
             await self._reconcile_external_exposure(ct)
 
             for candidate in candidates:
+                if ct.is_cancellation_requested:
+                    return  # остановка робота: новых сделок не начинаем
                 external_arbitrages = self._count_external_arbitrages()
                 if candidate.symbol in self._positions:
                     continue  # на символ — одна арбитражная позиция
@@ -337,12 +339,24 @@ class ArbTradeExecutor:
         short_leg = self._build_leg(short_connector, short_policy, estimate.symbol, OrderSide.SELL, estimate.short_leg.price, amount)
         legs = [long_leg, short_leg]
 
+        # С момента выставления первой заявки открытие доводится до конца без токена отмены:
+        # Ctrl+C посреди открытия не бросает живые заявки и набранный объём, а прекращает
+        # ожидание и откатывает ноги (или регистрирует позицию, если обе уже исполнены).
+
         # 1) выставляем ноги последовательно: отказ первой — вторая не выставляется вообще
-        for leg in legs:
-            if not await self._place(leg, ct):
+        for index, leg in enumerate(legs):
+            if index > 0 and ct.is_cancellation_requested:
+                self._log.warning(f"{estimate.symbol}: остановка робота посреди открытия — вторая нога не выставляется, откатываю первую")
+                residual_long, residual_short = await self._abort_legs(legs, _NONE)
+                self._stats.record_open_failed(estimate.symbol, "остановка робота посреди открытия")
+                if residual_long > ZERO or residual_short > ZERO:
+                    self._register_partial_position(estimate, long_leg, short_leg, residual_long, residual_short)
+                return
+
+            if not await self._place(leg, _NONE):
                 fail_reason = f"{_describe_leg(leg.policy.type, leg.request.side)} на {leg.connector.display_name} отклонён: {leg.error}"
                 self._log.error(f"{estimate.symbol}: {fail_reason}; вторая нога не выставляется")
-                residual_long, residual_short = await self._abort_legs(legs, ct)
+                residual_long, residual_short = await self._abort_legs(legs, _NONE)
                 self._stats.record_open_failed(estimate.symbol, fail_reason)
 
                 if residual_long > ZERO or residual_short > ZERO:
@@ -361,7 +375,7 @@ class ArbTradeExecutor:
                 if not leg.done
             )
             self._log.error(f"{estimate.symbol}: открытие не удалось ({reasons}); отменяю и откатываю ноги")
-            residual_long, residual_short = await self._abort_legs(legs, ct)
+            residual_long, residual_short = await self._abort_legs(legs, _NONE)
             self._stats.record_open_failed(estimate.symbol, reasons)
 
             if residual_long > ZERO or residual_short > ZERO:
@@ -392,6 +406,9 @@ class ArbTradeExecutor:
         """
         Опрашивает ноги до полного исполнения, смерти заявки или таймаута. При локальном
         догонании (ChaseLimit + Simulated) неисполненная заявка переставляется ближе к рынку.
+
+        Запросы к бирже здесь идут без токена отмены: по Ctrl+C ожидание прекращается
+        (как по таймауту), а не обрывается на полпути с живой заявкой без учёта.
         """
         deadline = self._clock.now() + timedelta(milliseconds=options.order_execution_timeout_ms)
         while True:
@@ -399,12 +416,18 @@ class ArbTradeExecutor:
             if not pending:
                 break
 
+            if ct.is_cancellation_requested:
+                for leg in pending:
+                    if leg.error is None:
+                        leg.error = f"ожидание прервано остановкой робота, набрано {formatting.volume(leg.filled)}"
+                break
+
             for leg in pending:
                 if leg.order_id is None:
                     leg.dead = True
                     continue
 
-                update = await leg.connector.fetch_order(leg.order_id, leg.request.symbol, ct)
+                update = await leg.connector.fetch_order(leg.order_id, leg.request.symbol, _NONE)
                 if update is None:
                     leg.dead = True
                     if leg.error is None:
@@ -422,7 +445,7 @@ class ArbTradeExecutor:
                     if leg.order_id is not None:
                         await leg.connector.cancel_order(leg.order_id, leg.request.symbol, _NONE)
                 else:
-                    await self._chase_step(leg, ct)
+                    await self._chase_step(leg, _NONE)
 
             if self._clock.now() >= deadline:
                 for leg in legs:
@@ -430,7 +453,10 @@ class ArbTradeExecutor:
                         leg.error = f"не исполнена за {options.order_execution_timeout_ms} мс, набрано {formatting.volume(leg.filled)}"
                 break
 
-            await delay(options.order_poll_interval_ms / 1000, ct)
+            try:
+                await delay(options.order_poll_interval_ms / 1000, ct)
+            except OperationCanceledError:
+                pass  # следующий виток зафиксирует остановку и выйдет из ожидания
 
     # ------------------------- догонание цены -------------------------
 
@@ -780,6 +806,7 @@ class ArbTradeExecutor:
         )
         if not await self._place(leg, ct):
             return  # отказ — повторим на следующем тике
+        # заявка выставлена: дальше без токена отмены, чтобы её исполнение не потерялось из учёта
 
         await self._wait_for_legs([leg], options, ct)
 
@@ -862,7 +889,8 @@ class ArbTradeExecutor:
             policy = MARKET_ORDER
 
         leg = self._build_leg(connector, policy, position.symbol, side, reference if reference is not None else ZERO, size, reduce_only=True)
-        if not await self._place(leg, ct):
+        # закрытие ноги не обрывается остановкой: начатое закрытие должно попасть в учёт
+        if not await self._place(leg, _NONE):
             return _CloseLegResult(ZERO, None, leg.error or "заявка отклонена")
 
         # market-заявку не опрашиваем: она обязана исполниться сразу
@@ -878,7 +906,7 @@ class ArbTradeExecutor:
         closed = min(leg.filled, size)
         if closed <= ZERO and policy.type == OrderType.MARKET:
             # исполнение market подтверждается статусом заявки, а при нуле — отсутствием позиции на бирже
-            update = await connector.fetch_order(leg.order_id, position.symbol, ct) if leg.order_id is not None else None
+            update = await connector.fetch_order(leg.order_id, position.symbol, _NONE) if leg.order_id is not None else None
             if update is not None:
                 _record_fill(leg, update.filled_amount, update.average_price, update.fee_quote)
                 closed = min(leg.filled, size)
@@ -888,7 +916,7 @@ class ArbTradeExecutor:
 
             if closed <= ZERO:
                 exposure_side = OrderSide.BUY if side == OrderSide.SELL else OrderSide.SELL
-                if await _has_exchange_position(connector, exposure_side, position.symbol, ct):
+                if await _has_exchange_position(connector, exposure_side, position.symbol, _NONE):
                     error = "рыночная заявка не подтверждена биржей" if update is None else f"рыночная заявка не исполнена (статус: {update.status})"
                     return _CloseLegResult(ZERO, leg.average_price, error)
 
