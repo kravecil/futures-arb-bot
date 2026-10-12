@@ -69,7 +69,10 @@ class AppRunner:
 
         options = self._config.current
         trading = "ВКЛЮЧЕНА" if options.arbitrage.enabled else "выключена (мониторинг)"
-        self._log.info(f"Сеанс запущен: режим {options.general.network_mode}, бирж {len(connectors)}, торговля {trading}")
+        self._log.info(
+            f"Сеанс запущен: режим {options.general.network_mode}, бирж {len(connectors)}, торговля {trading}, "
+            f"котировки {options.general.market_data.source}"
+        )
         self._log_notification_state(options.notifications)
 
         if self._cli.once:
@@ -301,5 +304,15 @@ def _validate_options(options: BotOptions) -> str | None:
 
     if options.general.refresh_interval_ms < 500:
         return "RefreshIntervalMs не может быть меньше 500 мс (бан со стороны бирж)."
+
+    market_data = options.general.market_data
+    if market_data.scan_interval_ms < 20:
+        return "market_data.scan_interval_ms не может быть меньше 20 мс."
+
+    if market_data.stale_after_ms < 500:
+        return "market_data.stale_after_ms не может быть меньше 500 мс."
+
+    if market_data.volume_refresh_seconds < 10:
+        return "market_data.volume_refresh_seconds не может быть меньше 10 с."
 
     return None

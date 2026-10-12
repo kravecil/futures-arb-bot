@@ -7,7 +7,7 @@ from __future__ import annotations
 
 from typing import Any
 
-import ccxt.async_support as ccxt_async
+import ccxt.pro as ccxt_async  # асинхронные классы бирж с REST и WebSocket (ccxt.pro)
 
 from futures_arb_bot.core.abstractions import EventLog, ExchangeConnector
 from futures_arb_bot.core.clock import Clock
@@ -32,7 +32,7 @@ SUPPORTED = (
 
 
 def instantiate(exchange_id: str, config: dict[str, Any]) -> Any:
-    """Создаёт асинхронный экземпляр биржи CCXT."""
+    """Создаёт асинхронный экземпляр биржи CCXT (REST + WebSocket)."""
     key = exchange_id.lower()
     if key not in SUPPORTED:
         raise ValueError(f"Неизвестный идентификатор биржи: {exchange_id}")

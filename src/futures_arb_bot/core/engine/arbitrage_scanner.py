@@ -25,6 +25,7 @@ from futures_arb_bot.core.abstractions import (
 from futures_arb_bot.core.cancellation import CancellationToken, OperationCanceledError, delay
 from futures_arb_bot.core.clock import Clock
 from futures_arb_bot.core.domain.arbitrage import SpreadEstimate
+from futures_arb_bot.core.domain.enums import MarketDataSource
 from futures_arb_bot.core.domain.market_data import ExchangeFees, FetchTickersResult, TickerSnapshot
 from futures_arb_bot.core.domain.options import BotOptions
 from futures_arb_bot.core.domain.statistics import DashboardSnapshot
@@ -68,6 +69,9 @@ class DefaultArbitrageScanner:
         self._last_funding_skip_log: dict[str, datetime] = {}
         self._snapshot: DashboardSnapshot | None = None
         self._last_tick_ms: float | None = None
+        self._subscriptions_at: float | None = None
+        self._streaming = False
+        self._no_stream_logged: set[str] = set()
         self._prepared = False
 
     @property
@@ -83,8 +87,13 @@ class DefaultArbitrageScanner:
             started = time.monotonic()
             try:
                 await self.scan_once(ct)
-                # тики не чаще refresh_interval_ms: опрос занимает часть интервала, ждём только остаток
-                interval = self._config.current.general.refresh_interval_ms / 1000
+                # тики не чаще интервала: опрос занимает его часть, ждём только остаток. С потоками
+                # WebSocket котировки свежие в любой момент — спреды пересчитываются часто (scan_interval_ms)
+                general = self._config.current.general
+                if general.market_data.source == MarketDataSource.WEBSOCKET and self._streaming:
+                    interval = general.market_data.scan_interval_ms / 1000
+                else:
+                    interval = general.refresh_interval_ms / 1000
                 await delay(interval - (time.monotonic() - started), ct)
             except Exception as ex:
                 if isinstance(ex, OperationCanceledError) and ct.is_cancellation_requested:
@@ -102,7 +111,10 @@ class DefaultArbitrageScanner:
         self._ensure_prepared()
         options = self._config.current
         tick_started = time.monotonic()
+        for connector in self._registry.connectors:
+            connector.update_market_data(options.general.market_data, options.general.refresh_interval_ms)
         fetched = await self._fetch_all(ct)
+        self._update_subscriptions(options)
         total_fetched = sum(len(result.tickers) for _, result in fetched)
         funding = await self._fetch_funding(ct)
 
@@ -149,6 +161,49 @@ class DefaultArbitrageScanner:
             by_exchange = {connector.id: result.tickers for connector, result in fetched}
             await self._executor.manage_open_positions(by_exchange, ct)
 
+    def _update_subscriptions(self, options: BotOptions) -> None:
+        """
+        Подписки на потоки лучших цен: пары, торгуемые минимум на двух биржах, с достаточным оборотом,
+        не больше max_symbols самых ликвидных — по последним снимкам REST. Пересчитываются раз
+        в volume_refresh_seconds (новые пары добавляются, подписанные остаются).
+        """
+        md = options.general.market_data
+        if md.source != MarketDataSource.WEBSOCKET:
+            return
+        now = time.monotonic()
+        if self._subscriptions_at is not None and now - self._subscriptions_at < md.volume_refresh_seconds:
+            return
+        self._subscriptions_at = now
+
+        symbols_options = options.symbols
+        book: dict[str, dict[str, Decimal]] = {}
+        for connector in self._registry.connectors:
+            allowed = self._allowed_symbols.get(connector.id, set())
+            for symbol, ticker in connector.rest_tickers.items():
+                if symbol not in allowed:
+                    continue
+                if ticker.quote_volume_24h > 0 and ticker.quote_volume_24h < symbols_options.min_quote_volume24h_usd:
+                    continue
+                book.setdefault(symbol, {})[connector.id] = ticker.quote_volume_24h
+
+        cross = [(symbol, max(volumes.values())) for symbol, volumes in book.items() if len(volumes) >= 2]
+        if symbols_options.max_symbols > 0:
+            cross = sorted(cross, key=lambda x: x[1], reverse=True)[: symbols_options.max_symbols]
+        wanted = {symbol for symbol, _ in cross}
+
+        for connector in self._registry.connectors:
+            if not connector.supports_streaming:
+                if connector.id not in self._no_stream_logged:
+                    self._no_stream_logged.add(connector.id)
+                    self._log.warning(f"[{connector.display_name}] потока котировок в ccxt нет — котировки по REST")
+                continue
+            symbols = {s for s in wanted if s in book and connector.id in book[s]}
+            added = connector.subscribe_quotes(symbols)
+            if added:
+                self._streaming = True
+                total = len(connector.streamed_symbols)
+                self._log.info(f"[{connector.display_name}] котировки по WebSocket: +{len(added)} пар, всего в подписке {total}")
+
     def _ensure_prepared(self) -> None:
         """Строит карту бирж и множества разрешённых символов (один раз за сеанс)."""
         if self._prepared:
@@ -171,7 +226,9 @@ class DefaultArbitrageScanner:
         async def fetch(connector: ExchangeConnector) -> tuple[ExchangeConnector, FetchTickersResult | None]:
             try:
                 result = await connector.fetch_tickers(ct)
-                self._stats.record_request(connector.id, result.latency, success=True)
+                if result.source == "rest":
+                    self._stats.record_request(connector.id, result.latency, success=True)
+                self._stats.record_quote_source(connector.id, result.source)
                 return connector, result
             except OperationCanceledError:
                 raise

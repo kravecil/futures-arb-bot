@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Collection, Mapping, Sequence
 from datetime import datetime, timedelta
 from typing import Protocol, runtime_checkable
 
@@ -20,7 +20,7 @@ from futures_arb_bot.core.domain.market_data import (
     TickerSnapshot,
 )
 from futures_arb_bot.core.domain.notifications import NotificationDelivery
-from futures_arb_bot.core.domain.options import BotOptions, ExchangeConfigEntry
+from futures_arb_bot.core.domain.options import BotOptions, ExchangeConfigEntry, MarketDataOptions
 from futures_arb_bot.core.domain.statistics import DashboardSnapshot, LogEvent, SessionReport
 
 
@@ -90,6 +90,26 @@ class ExchangeConnector(Protocol):
     @property
     def perpetual_markets(self) -> Sequence[MarketInfo]: ...
 
+    @property
+    def supports_streaming(self) -> bool:
+        """Есть ли поток котировок WebSocket."""
+        ...
+
+    @property
+    def streamed_symbols(self) -> set[str]: ...
+
+    @property
+    def stream_messages(self) -> int: ...
+
+    @property
+    def rest_tickers(self) -> Mapping[str, TickerSnapshot]:
+        """Последний снимок тикеров по REST (с оборотами) — по нему выбираются подписки."""
+        ...
+
+    def update_market_data(self, market_data: MarketDataOptions, refresh_interval_ms: int) -> None: ...
+
+    def subscribe_quotes(self, symbols: Collection[str]) -> list[str]: ...
+
     async def connect(self, ct: CancellationToken | None = None) -> None: ...
 
     async def fetch_tickers(self, ct: CancellationToken | None = None) -> FetchTickersResult: ...
@@ -135,6 +155,8 @@ class StatisticsCollector(Protocol):
     def record_scan_tick(self, tickers_fetched: int) -> None: ...
 
     def record_tick_duration(self, duration_ms: float) -> None: ...
+
+    def record_quote_source(self, exchange_id: str, source: str) -> None: ...
 
     def record_quote_age(self, age_ms: float) -> None: ...
 

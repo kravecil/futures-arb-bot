@@ -114,6 +114,8 @@ class FetchTickersResult:
 
     tickers: Mapping[str, TickerSnapshot]
     latency: timedelta = field(default_factory=timedelta)
+    source: str = "rest"
+    """rest — свежий запрос REST; ws — котировки из потока; cache — недавний снимок REST без нового запроса."""
 
 
 @dataclass(frozen=True, slots=True)

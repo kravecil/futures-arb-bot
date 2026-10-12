@@ -6,8 +6,13 @@
 
 general:
   network_mode: live            # DryRun | Testnet | Live
-  refresh_interval_ms: 500      # период цикла сканирования, мс (не меньше 500)
+  refresh_interval_ms: 500      # период опроса REST, мс (не меньше 500)
   write_log_file: true          # журнал сеанса в logs/session-*.log
+  market_data:
+    source: WebSocket           # WebSocket | Rest
+    scan_interval_ms: 100       # WebSocket: как часто пересчитывать спреды по свежим котировкам
+    stale_after_ms: 3000        # поток молчит дольше — котировки биржи по REST (раз в refresh_interval_ms)
+    volume_refresh_seconds: 60  # обновление оборотов за 24 ч и набора подписок по REST
   console_ui:
     refresh_ms: 400             # период перерисовки дашборда
     log_lines: 9                # строк журнала в панели (1..50)

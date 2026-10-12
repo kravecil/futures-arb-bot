@@ -11,7 +11,7 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from futures_arb_bot.core.domain.enums import ChaseMode, MaxSendEndpoint, NetworkMode, OrderType, TimeInForce
+from futures_arb_bot.core.domain.enums import ChaseMode, MarketDataSource, MaxSendEndpoint, NetworkMode, OrderType, TimeInForce
 
 
 def normalize_key(key: str) -> str:
@@ -61,6 +61,19 @@ class UiOptions(ConfigModel):
         return value if 0 < value <= 50 else 9
 
 
+class MarketDataOptions(ConfigModel):
+    """Источник котировок (appsettings.yaml → general.market_data)."""
+
+    source: MarketDataSource = MarketDataSource.WEBSOCKET
+    """WebSocket — потоки бирж с откатом на REST; Rest — только опрос."""
+    scan_interval_ms: int = 100
+    """Период расчёта спредов по свежим котировкам из потоков, мс."""
+    stale_after_ms: int = 3_000
+    """Поток биржи молчит дольше — котировки берутся по REST, пока поток не оживёт."""
+    volume_refresh_seconds: int = 60
+    """Как часто обновлять по REST обороты за 24 ч (в потоках лучших цен их нет) и набор подписок."""
+
+
 class GeneralOptions(ConfigModel):
     """Общие настройки приложения (appsettings.yaml → general)."""
 
@@ -68,6 +81,7 @@ class GeneralOptions(ConfigModel):
     refresh_interval_ms: int = 2_000
     write_log_file: bool = True
     console_ui: UiOptions = Field(default_factory=UiOptions)
+    market_data: MarketDataOptions = Field(default_factory=MarketDataOptions)
 
 
 class ChaseOptions(ConfigModel):

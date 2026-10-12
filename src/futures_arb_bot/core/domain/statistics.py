@@ -30,6 +30,10 @@ class ExchangeRuntimeStat:
     errors: int
     avg_latency_ms: float
     taker_percent: Decimal
+    ws_ticks: int = 0
+    """Тиков, в которых котировки биржи пришли из потока WebSocket."""
+    rest_ticks: int = 0
+    """Тиков с котировками по REST (свежий запрос или недавний снимок)."""
 
 
 @dataclass(frozen=True, slots=True)

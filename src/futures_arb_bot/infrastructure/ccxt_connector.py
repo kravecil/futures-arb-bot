@@ -5,9 +5,11 @@
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import os
 import time
-from collections.abc import Mapping
+from collections.abc import Collection, Mapping
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Any
@@ -17,7 +19,7 @@ import ccxt
 from futures_arb_bot.core.abstractions import EventLog
 from futures_arb_bot.core.cancellation import CancellationToken
 from futures_arb_bot.core.clock import Clock
-from futures_arb_bot.core.domain.enums import NetworkMode, OrderSide, OrderStatus, OrderType
+from futures_arb_bot.core.domain.enums import MarketDataSource, NetworkMode, OrderSide, OrderStatus, OrderType
 from futures_arb_bot.core.domain.market_data import (
     ExchangeFees,
     FetchTickersResult,
@@ -28,11 +30,12 @@ from futures_arb_bot.core.domain.market_data import (
     PositionSnapshot,
     TickerSnapshot,
 )
-from futures_arb_bot.core.domain.options import ExchangeConfigEntry
+from futures_arb_bot.core.domain.options import ExchangeConfigEntry, MarketDataOptions
 from futures_arb_bot.core.domain.order_execution import ExchangeCapabilityMap, OrderParamsBuilder
 from futures_arb_bot.core.engine.logging_bridge import get_logger
 from futures_arb_bot.core.numbers import HUNDRED, ZERO, dec_str, to_dec
 from futures_arb_bot.infrastructure.ccxt_factory import instantiate
+from futures_arb_bot.infrastructure.quote_stream import QuoteStream
 
 FUNDING_CACHE_TTL = timedelta(minutes=5)
 """Фандинг-рейты обновляются раз в 4–8 часов, REST-эндпоинт тяжёлый — кэшируем."""
@@ -60,6 +63,16 @@ class CcxtExchangeConnector:
         self._funding_unavailable_logged = False
         self._leverage_warned: set[str] = set()
 
+        # --- котировки: последний снимок REST (обороты, запасной источник) и поток WebSocket ---
+        self._rest_result: FetchTickersResult | None = None
+        self._rest_at: float | None = None
+        self._volumes: dict[str, Decimal] = {}
+        self._market_data = MarketDataOptions()
+        self._refresh_interval_ms = 2_000
+        self._volume_task: asyncio.Task[None] | None = None
+        self._stream_down_logged = False
+        self._stream: QuoteStream | None = None
+
         config: dict[str, Any] = {"enableRateLimit": True, "timeout": 15000}
 
         api_key = _first_not_empty(entry.api_key, _env_override(entry.id, "API_KEY"), _env_override(entry.id, "APIKEY"))
@@ -82,6 +95,7 @@ class CcxtExchangeConnector:
         # какие опции реально ушли в CCXT — без этого «ноль фьючерсных рынков» не диагностируется
         self._ccxt_options = ", ".join(f"{k}={_option_text(v)}" for k, v in options.items()) if options else "нет"
         self._api = instantiate(entry.id, config)
+        self._stream = QuoteStream(self._api, entry.id, self.display_name, log, clock)
 
     # ------------------------- свойства -------------------------
 
@@ -167,9 +181,82 @@ class CcxtExchangeConnector:
                 f"[{self.display_name}] CCXT не вернул ни одного линейного бессрочного фьючерса — проверьте defaultType в разделе options биржи"
             )
 
-    async def fetch_tickers(self, ct: CancellationToken | None = None) -> FetchTickersResult:
-        _check(ct)
+    # ------------------------- котировки: WebSocket с откатом на REST -------------------------
 
+    @property
+    def supports_streaming(self) -> bool:
+        """Есть ли у биржи в ccxt поток лучших цен (watch_bids_asks) или тикеров (watch_tickers)."""
+        return self._stream is not None and self._stream.supported
+
+    @property
+    def streamed_symbols(self) -> set[str]:
+        return self._stream.symbols if self._stream is not None else set()
+
+    @property
+    def stream_messages(self) -> int:
+        return self._stream.messages if self._stream is not None else 0
+
+    @property
+    def rest_tickers(self) -> Mapping[str, TickerSnapshot]:
+        """Последний снимок тикеров по REST (с оборотами за 24 ч) — по нему выбираются подписки."""
+        return self._rest_result.tickers if self._rest_result is not None else {}
+
+    def update_market_data(self, market_data: MarketDataOptions, refresh_interval_ms: int) -> None:
+        """Актуальные настройки источника котировок (перечитываются сканером каждый тик)."""
+        self._market_data = market_data
+        self._refresh_interval_ms = refresh_interval_ms
+
+    def subscribe_quotes(self, symbols: Collection[str]) -> list[str]:
+        """Подписаться на лучшие цены пар (добавляются только новые). Возвращает новые пары."""
+        if self._stream is None or not self._stream.supported:
+            return []
+        return self._stream.subscribe(symbols)
+
+    async def fetch_tickers(self, ct: CancellationToken | None = None) -> FetchTickersResult:
+        """
+        Котировки биржи. В режиме WebSocket — из потока, пока он жив; оборот за 24 ч обновляется
+        по REST в фоне раз в volume_refresh_seconds. Поток молчит дольше stale_after_ms — снимок REST,
+        но не чаще refresh_interval_ms (между запросами отдаётся последний снимок).
+        """
+        _check(ct)
+        md = self._market_data
+        stream = self._stream
+        if md.source == MarketDataSource.WEBSOCKET and stream is not None and stream.started:
+            if stream.healthy(md.stale_after_ms / 1000):
+                if self._stream_down_logged:
+                    self._stream_down_logged = False
+                    self._log.info(f"[{self.display_name}] котировки снова из потока WebSocket")
+                self._schedule_volume_refresh(md)
+                merged: dict[str, TickerSnapshot] = dict(self.rest_tickers)
+                merged.update(stream.snapshot(self._volumes))
+                return FetchTickersResult(merged, timedelta(0), "ws")
+
+            silent = stream.silent_for()
+            if not self._stream_down_logged and silent is not None and silent * 1000 >= md.stale_after_ms:
+                self._stream_down_logged = True
+                self._log.warning(f"[{self.display_name}] поток котировок молчит {silent:.0f} с — котировки по REST до его восстановления")
+
+            recent = self._rest_at is not None and (time.monotonic() - self._rest_at) * 1000 < self._refresh_interval_ms
+            if self._rest_result is not None and recent:
+                return FetchTickersResult(self._rest_result.tickers, timedelta(0), "cache")
+
+        return await self._fetch_tickers_rest()
+
+    def _schedule_volume_refresh(self, md: MarketDataOptions) -> None:
+        if self._volume_task is not None and not self._volume_task.done():
+            return
+        if self._rest_at is not None and time.monotonic() - self._rest_at < md.volume_refresh_seconds:
+            return
+        self._volume_task = asyncio.get_running_loop().create_task(self._refresh_volumes())
+
+    async def _refresh_volumes(self) -> None:
+        try:
+            await self._fetch_tickers_rest()
+        except Exception as ex:
+            self._logger.debug("фоновое обновление оборотов не удалось", exc_info=ex)
+            self._rest_at = time.monotonic()  # не долбим биржу каждый тик — повторим через интервал
+
+    async def _fetch_tickers_rest(self) -> FetchTickersResult:
         started = time.perf_counter()
         raw: dict[str, Any] = await self._api.fetch_tickers()
 
@@ -220,7 +307,11 @@ class CcxtExchangeConnector:
                 timestamp,
             )
 
-        return FetchTickersResult(result, timedelta(seconds=time.perf_counter() - started))
+        fetched = FetchTickersResult(result, timedelta(seconds=time.perf_counter() - started), "rest")
+        self._rest_result = fetched
+        self._rest_at = time.monotonic()
+        self._volumes = {symbol: t.quote_volume_24h for symbol, t in result.items()}
+        return fetched
 
     # ------------------------- заявки -------------------------
 
@@ -377,6 +468,12 @@ class CcxtExchangeConnector:
         return False, self._default_fees
 
     async def aclose(self) -> None:
+        if self._volume_task is not None and not self._volume_task.done():
+            self._volume_task.cancel()
+            with contextlib.suppress(BaseException):
+                await self._volume_task
+        if self._stream is not None:
+            await self._stream.aclose()
         await self._api.close()
 
 

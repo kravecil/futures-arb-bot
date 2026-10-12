@@ -144,6 +144,7 @@ class SessionReportPrinter:
         table.add_column("[cyan]Ошибок[/]", justify="right")
         table.add_column("[cyan]Задержка[/]", justify="right")
         table.add_column("[cyan]Taker[/]", justify="right")
+        table.add_column("[cyan]Котировки[/]", justify="right")
 
         for exchange in report.exchanges:
             taker = f"{format_number(exchange.taker_percent, min_decimals=0, max_decimals=4)}%" if exchange.taker_percent > 0 else "—"
@@ -155,6 +156,7 @@ class SessionReportPrinter:
                 f"[red]{exchange.errors}[/]" if exchange.errors > 0 else "0",
                 f"{format_number(exchange.avg_latency_ms, min_decimals=0, max_decimals=0)} мс",
                 taker,
+                _quotes_source(exchange.ws_ticks, exchange.rest_ticks),
             )
 
         console.print(table)
@@ -206,6 +208,17 @@ class SessionReportPrinter:
             f"Итоговая PnL за сеанс: [bold {color}]{formatting.usd(pnl)}[/]{suffix}, уплачено комиссий {formatting.usd(report.fees_paid_usd)}."
         )
         console.print()
+
+
+def _quotes_source(ws_ticks: int, rest_ticks: int) -> str:
+    """Доля тиков с котировками из потока WebSocket."""
+    total = ws_ticks + rest_ticks
+    if total == 0:
+        return "—"
+    if ws_ticks == 0:
+        return "REST"
+    share = ws_ticks * 100 / total
+    return f"WS {format_number(share, min_decimals=0, max_decimals=0)}%"
 
 
 def _describe_mode(mode: NetworkMode, trading: bool) -> str:

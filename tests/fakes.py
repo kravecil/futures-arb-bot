@@ -113,6 +113,9 @@ class FakeConnector:
         self.open_positions: list[PositionSnapshot] = []
         self.fail_fetch_positions = False
         self._order_counter = 0
+        self.streaming_supported = False
+        self.subscribed: set[str] = set()
+        self.market_data = None
 
     @property
     def id(self) -> str:
@@ -137,6 +140,32 @@ class FakeConnector:
     @property
     def perpetual_markets(self) -> list[MarketInfo]:
         return self._markets
+
+    @property
+    def supports_streaming(self) -> bool:
+        return self.streaming_supported
+
+    @property
+    def streamed_symbols(self) -> set[str]:
+        return set(self.subscribed)
+
+    @property
+    def stream_messages(self) -> int:
+        return 0
+
+    @property
+    def rest_tickers(self) -> Mapping[str, TickerSnapshot]:
+        return self.tickers
+
+    def update_market_data(self, market_data, refresh_interval_ms: int) -> None:  # type: ignore[no-untyped-def]
+        self.market_data = market_data
+
+    def subscribe_quotes(self, symbols) -> list[str]:  # type: ignore[no-untyped-def]
+        if not self.streaming_supported:
+            return []
+        fresh = sorted(s for s in symbols if s not in self.subscribed)
+        self.subscribed.update(fresh)
+        return fresh
 
     async def connect(self, ct: CancellationToken | None = None) -> None:
         self.connected = True

@@ -24,6 +24,8 @@ class _ExchangeAccumulator:
     requests: int = 0
     errors: int = 0
     latency_sum_ms: float = 0.0
+    ws_ticks: int = 0
+    rest_ticks: int = 0
 
     @property
     def avg_latency_ms(self) -> float:
@@ -63,6 +65,14 @@ class DefaultStatisticsCollector:
         self._tick_sum_ms += duration_ms
         self._tick_max_ms = max(self._tick_max_ms, duration_ms)
         self._last_tick_ms = duration_ms
+
+    def record_quote_source(self, exchange_id: str, source: str) -> None:
+        """Откуда в этом тике пришли котировки биржи: ws (поток) или rest/cache (REST)."""
+        acc = self._accumulator(exchange_id)
+        if source == "ws":
+            acc.ws_ticks += 1
+        else:
+            acc.rest_ticks += 1
 
     def record_quote_age(self, age_ms: float) -> None:
         """Возраст самой старой котировки сигнала в момент решения."""
@@ -134,7 +144,16 @@ class DefaultStatisticsCollector:
         exchanges = sorted(
             (
                 ExchangeRuntimeStat(
-                    key, acc.display_name, acc.mode, acc.markets, acc.requests, acc.errors, round(acc.avg_latency_ms, 1), acc.taker_percent
+                    key,
+                    acc.display_name,
+                    acc.mode,
+                    acc.markets,
+                    acc.requests,
+                    acc.errors,
+                    round(acc.avg_latency_ms, 1),
+                    acc.taker_percent,
+                    acc.ws_ticks,
+                    acc.rest_ticks,
                 )
                 for key, acc in self._exchanges.items()
             ),

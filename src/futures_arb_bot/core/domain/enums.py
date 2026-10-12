@@ -33,6 +33,15 @@ class NetworkMode(_CaseInsensitiveEnum):
     """Реальная торговля настоящими деньгами. Требует allow_live = true."""
 
 
+class MarketDataSource(_CaseInsensitiveEnum):
+    """Откуда брать котировки."""
+
+    WEBSOCKET = "WebSocket"
+    """Потоки бирж (ccxt.pro); при молчании потока биржа временно переходит на REST."""
+    REST = "Rest"
+    """Опрос REST раз в refresh_interval_ms."""
+
+
 class OrderSide(_CaseInsensitiveEnum):
     BUY = "Buy"
     SELL = "Sell"

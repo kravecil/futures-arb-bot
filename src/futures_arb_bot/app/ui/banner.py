@@ -6,7 +6,7 @@ from rich.table import Table
 
 from futures_arb_bot.app.console import LeftRule, console, esc, figlet
 from futures_arb_bot.core.abstractions import ConfigProvider
-from futures_arb_bot.core.domain.enums import NetworkMode
+from futures_arb_bot.core.domain.enums import MarketDataSource, NetworkMode
 from futures_arb_bot.core.engine.formatting import GREY, SILVER, pct
 from futures_arb_bot.core.numbers import dec_str
 
@@ -45,6 +45,15 @@ def print_banner(config: ConfigProvider) -> None:
         "[bright_black]Ордер:[/]",
         f"{dec_str(arbitrage.order_size_usd)} USD × {arbitrage.leverage} (плечо), комиссия {'учитывается' if arbitrage.include_fees else 'НЕ учитывается'}",
     )
+    md = options.general.market_data
+    if md.source == MarketDataSource.WEBSOCKET:
+        quotes = (
+            f"[green]WebSocket[/] [bright_black](расчёт каждые {md.scan_interval_ms} мс; поток молчит > {md.stale_after_ms} мс — "
+            f"REST раз в {options.general.refresh_interval_ms} мс)[/]"
+        )
+    else:
+        quotes = f"REST [bright_black](опрос раз в {options.general.refresh_interval_ms} мс)[/]"
+    grid.add_row("[bright_black]Котировки:[/]", quotes)
     grid.add_row("[bright_black]Конфигурация:[/]", esc(config.config_directory))
 
     console.print(grid)
