@@ -40,7 +40,7 @@ asyncio_default_fixture_loop_scope = "function"
 addopts = "-q"
 
 [tool.ruff]
-line-length = 140
+line-length = 150
 target-version = "py314"
 src = ["src", "tests"]
 
@@ -51,4 +51,5 @@ ignore = [
     "RUF002",
     "RUF003",
     "SIM105",
+    "SIM108", # тернарник не всегда читаемее
 ]
