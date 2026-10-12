@@ -1,0 +1,15 @@
+# Фильтры торговых пар. По умолчанию берутся ВСЕ линейные бессрочные фьючерсы в USDT
+# с оборотом от 5 млн USDT/сутки (самые ликвидные 400).
+# include — белый список шаблонов (если не пуст, торгуем только его); exclude — чёрный список.
+# Шаблоны поддерживают * и ?. Примеры: 'BTC/USDT:*' — все контракты BTC/USDT;
+# '*/USDT:USDT' — все линейные; '*UP/USDT:*' — все с суффиксом UP.
+
+symbols:
+  quote_currencies: [USDT]
+  min_quote_volume24h_usd: 5000000
+  max_symbols: 400
+  max_ticker_age_seconds: 15
+  max_ticker_skew_seconds: 5
+  include: []
+  exclude:
+    - "*ONE/USDT:*"

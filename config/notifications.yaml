@@ -1,0 +1,27 @@
+# Необязательный раздел: уведомления администратору в MAX Messenger о спред-сигналах,
+# прошедших фильтры робота (min_spread_percent_up и проверка фандинга).
+# Файл можно удалить — тогда уведомления выключены.
+# Токен безопаснее задавать в .env: ARB_NOTIFICATIONS__BOT_TOKEN=...
+# chat_id узнаётся командой --notify-chat-id (бот не может написать первым:
+# сначала отправьте боту любое сообщение).
+
+notifications:
+  enabled: false
+  bot_token: ""
+  admin_chat_id: ""
+  api_base_url: https://platform-api2.max.ru
+  endpoint: Messages              # Messages | ChatsMessage
+  min_spread_percent: null        # null — наследует arbitrage.min_spread_percent_up
+  use_markdown: false
+  silent: false
+  signal_cooldown_seconds: 120
+  max_per_minute: 20
+  timeout_ms: 5000
+  max_retries: 3
+  failure_circuit_limit: 1
+  circuit_break_minutes: 2
+  queue_capacity: 64
+  text_template: |-
+    Арбитраж {symbol}: нетто {net} (gross {gross})
+    лонг {longExchange} @ {longPrice} → шорт {shortExchange} @ {shortPrice}
+    фандинг {longFunding}/{shortFunding} · объём {volume} $ · {time}

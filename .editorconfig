@@ -8,15 +8,13 @@ trim_trailing_whitespace = true
 indent_style = space
 indent_size = 4
 
-[*.cs]
-csharp_style_namespace_declarations = file_scoped:suggestion
-csharp_style_prefer_primary_constructors = true:suggestion
-csharp_style_prefer_collection_expression = true:suggestion
-csharp_prefer_braces = when_multiline:suggestion
-dotnet_style_readonly_field = true:suggestion
-dotnet_diagnostic.CA1848.severity = none # LoggerMessage-делегаты не обязательны для наглядности
+[*.py]
+indent_size = 4
 
-[*.{json,yml,yaml,csproj,props,targets}]
+[*.{cmd,bat,ps1}]
+end_of_line = crlf
+
+[*.{json,yml,yaml,toml}]
 indent_size = 2
 
 [*.md]

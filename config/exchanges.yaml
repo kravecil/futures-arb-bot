@@ -1,0 +1,46 @@
+# Список бирж. id — идентификаторы CCXT. Включайте/отключайте полем enabled.
+# API-ключи нужны только для торговли (Testnet/Live); для мониторинга спредов достаточно пустых.
+# Ключи храните в .env (файл не коммитится):
+#   ARB_<ID>_API_KEY, ARB_<ID>_SECRET, ARB_<ID>_PASSWORD — например ARB_OKX_PASSWORD.
+# Поля api_key / secret / password здесь тоже поддерживаются, но имеют приоритет над .env.
+# Необязательное поле execution у биржи переопределяет arbitrage.execution, например:
+#   execution: { limit_offset_bps: 15, chase: { max_steps: 2 } }
+# Ещё доступны: taker_fee_percent, maker_fee_percent, options (доп. опции CCXT).
+
+exchanges:
+  items:
+    - id: binanceusdm
+      name: Binance USD-M Futures
+      enabled: false
+
+    - id: bybit
+      name: Bybit Linear
+      enabled: false
+
+    - id: okx
+      name: OKX Swap
+      enabled: true
+
+    - id: gate
+      name: Gate.io Futures
+      enabled: true
+
+    - id: mexc
+      name: MEXC Futures
+      enabled: false
+
+    - id: kucoinfutures
+      name: KuCoin Futures
+      enabled: false
+
+    - id: bitget
+      name: Bitget USDT-M
+      enabled: false
+
+    - id: htx
+      name: HTX Swap
+      enabled: false
+
+    - id: bingx
+      name: BingX Perpetual
+      enabled: false
