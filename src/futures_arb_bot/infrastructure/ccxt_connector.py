@@ -11,6 +11,7 @@ import os
 import time
 import uuid
 from collections.abc import Collection, Mapping
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Any
@@ -25,6 +26,7 @@ from futures_arb_bot.core.domain.market_data import (
     ExchangeFees,
     FetchTickersResult,
     MarketInfo,
+    OrderBookSnapshot,
     OrderRequest,
     OrderResult,
     OrderUpdate,
@@ -34,7 +36,7 @@ from futures_arb_bot.core.domain.market_data import (
 from futures_arb_bot.core.domain.options import ExchangeConfigEntry, MarketDataOptions, OrdersOptions
 from futures_arb_bot.core.domain.order_execution import ExchangeCapabilityMap, OrderParamsBuilder
 from futures_arb_bot.core.engine.logging_bridge import get_logger
-from futures_arb_bot.core.numbers import HUNDRED, ZERO, dec_str, to_dec
+from futures_arb_bot.core.numbers import HUNDRED, ONE, ZERO, dec_str, to_dec
 from futures_arb_bot.infrastructure.ccxt_factory import instantiate
 from futures_arb_bot.infrastructure.order_stream import OrderStream
 from futures_arb_bot.infrastructure.quote_stream import QuoteStream
@@ -59,6 +61,8 @@ class CcxtExchangeConnector:
         self._logger = get_logger(f"Ccxt.{entry.id}")
         self._markets: dict[str, MarketInfo] = {}
         self._fees_by_symbol: dict[str, ExchangeFees] = {}
+        self._contract_sizes: dict[str, Decimal] = {}
+        """Размер контракта по символу (монет в контракте). Ядро считает в монетах, биржа — в контрактах."""
         self._default_fees = _FALLBACK_FEES
         self._funding_cache: dict[str, Decimal] = {}
         self._funding_fetched_at: datetime | None = None
@@ -100,7 +104,7 @@ class CcxtExchangeConnector:
         self._ccxt_options = ", ".join(f"{k}={_option_text(v)}" for k, v in options.items()) if options else "нет"
         self._api = instantiate(entry.id, config)
         self._stream = QuoteStream(self._api, entry.id, self.display_name, log, clock)
-        self._order_stream = OrderStream(self._api, entry.id, self.display_name, log, lambda order: parse_order_update(order))
+        self._order_stream = OrderStream(self._api, entry.id, self.display_name, log, lambda order: self._parse_update(order))
 
     # ------------------------- свойства -------------------------
 
@@ -140,6 +144,8 @@ class CcxtExchangeConnector:
         markets: Mapping[str, Any] = await self._api.load_markets()
         self._markets.clear()
         self._fees_by_symbol.clear()
+        self._contract_sizes.clear()
+        tick_size_precision = getattr(self._api, "precisionMode", None) == getattr(ccxt, "TICK_SIZE", 4)
 
         for symbol, market in markets.items():
             if market.get("swap") is not True or market.get("linear") is not True or market.get("active") is False:
@@ -154,14 +160,21 @@ class CcxtExchangeConnector:
             except Exception:
                 pass  # у части бирж limits не заполнен — работаем без ограничений
 
+            contract_size = _contract_size_of(market)
+            self._contract_sizes[symbol] = contract_size
+            step = _amount_step_of(market, tick_size_precision)
+
+            # объёмы в MarketInfo — в базовой монете: лимиты и шаг биржи заданы в контрактах
             self._markets[symbol] = MarketInfo(
                 symbol,
                 is_perpetual=True,
                 is_linear=True,
                 quote_currency=market.get("quote") or market.get("settle") or "USDT",
-                min_amount=to_dec(min_amount) if isinstance(min_amount, (int, float)) and min_amount > 0 else None,
+                min_amount=to_dec(min_amount) * contract_size if isinstance(min_amount, (int, float)) and min_amount > 0 else None,
                 taker_percent=taker_pct,
                 maker_percent=maker_pct,
+                contract_size=contract_size,
+                amount_step=step * contract_size if step is not None else None,
             )
 
             if taker_pct > ZERO:
@@ -360,7 +373,9 @@ class CcxtExchangeConnector:
         try:
             _check(ct)
 
-            amount = float(self._api.amount_to_precision(request.symbol, float(request.amount)))
+            # ядро считает в монетах, биржа (OKX, Gate…) ждёт контракты
+            contracts = request.amount / self.contract_size(request.symbol)
+            amount = float(self._api.amount_to_precision(request.symbol, float(contracts)))
             if amount <= 0:
                 return OrderResult.fail(f"объём после округления равен нулю ({dec_str(request.amount)})")
 
@@ -403,7 +418,7 @@ class CcxtExchangeConnector:
 
     def _order_result(self, request: OrderRequest, order: Mapping[str, Any], client_id: str | None) -> OrderResult:
         filled_raw = order.get("filled")
-        filled = to_dec(filled_raw) if isinstance(filled_raw, (int, float)) and filled_raw > 0 else ZERO
+        filled = to_dec(filled_raw) * self.contract_size(request.symbol) if isinstance(filled_raw, (int, float)) and filled_raw > 0 else ZERO
         average = _positive(order.get("average"))
         if average is None:
             average = _positive(order.get("price"))
@@ -417,7 +432,7 @@ class CcxtExchangeConnector:
         fee = fee_in_quote(order, request.symbol, average) if filled > ZERO else None
         if order_id is not None and self._order_stream is not None:
             # исходное состояние заявки — в кэш потока: дальше статусы приходят событиями
-            update = parse_order_update(order, request.symbol)
+            update = self._parse_update(order, request.symbol)
             if update is not None:
                 self._order_stream.remember(update, client_id)
         return OrderResult.ok(str(order_id) if order_id is not None else None, average, filled, fee)
@@ -458,7 +473,7 @@ class CcxtExchangeConnector:
         try:
             _check(ct)
             order = await self._api.fetch_order(order_id, symbol)
-            update = parse_order_update(order, symbol, order_id)
+            update = self._parse_update(order, symbol, order_id)
             if update is not None and stream is not None:
                 stream.remember(update)
             return update
@@ -508,8 +523,50 @@ class CcxtExchangeConnector:
                 continue  # закрытые позиции биржи отдают нулевыми — экспозиции в них нет
 
             side = OrderSide.SELL if position.get("side") == "short" else OrderSide.BUY
-            result.append(PositionSnapshot(symbol, side, to_dec(contracts), _positive(position.get("entryPrice"))))
+            result.append(PositionSnapshot(symbol, side, to_dec(contracts) * self.contract_size(symbol), _positive(position.get("entryPrice"))))
         return result
+
+    async def fetch_order_book(self, symbol: str, depth: int, ct: CancellationToken | None = None) -> OrderBookSnapshot | None:
+        """Верх стакана запросом REST; объёмы уровней — в базовой монете. None — стакан недоступен."""
+        try:
+            _check(ct)
+            book = await self._api.fetch_order_book(symbol, _book_limit(self.id, depth))
+        except Exception as ex:
+            if _is_cancel(ex):
+                raise
+            self._logger.debug(f"FetchOrderBook {symbol} failed", exc_info=ex)
+            return None
+
+        size = self.contract_size(symbol)
+
+        def levels(raw: Any) -> tuple[tuple[Decimal, Decimal], ...]:
+            result: list[tuple[Decimal, Decimal]] = []
+            for level in raw or []:
+                if not isinstance(level, (list, tuple)) or len(level) < 2:
+                    continue
+                price, amount = level[0], level[1]
+                if isinstance(price, (int, float)) and isinstance(amount, (int, float)) and price > 0 and amount > 0:
+                    result.append((to_dec(price), to_dec(amount) * size))
+            return tuple(result)
+
+        ms = book.get("timestamp") if isinstance(book, Mapping) else None
+        stamp = datetime.fromtimestamp(ms / 1000, UTC) if isinstance(ms, (int, float)) and ms > 0 else self._clock.now()
+        return OrderBookSnapshot(self.id, symbol, levels(book.get("bids")), levels(book.get("asks")), stamp)
+
+    def contract_size(self, symbol: str) -> Decimal:
+        """Монет в одном контракте биржи (1, если биржа считает объём в монетах или размер неизвестен)."""
+        return self._contract_sizes.get(symbol, ONE)
+
+    def _parse_update(self, order: Mapping[str, Any], symbol: str | None = None, order_id: str | None = None) -> OrderUpdate | None:
+        """Заявка ccxt → OrderUpdate с исполнением в базовой монете (а не в контрактах)."""
+        update = parse_order_update(order, symbol, order_id)
+        if update is None:
+            return None
+        sym = symbol or order.get("symbol") or ""
+        size = self.contract_size(sym)
+        if size == ONE or update.filled_amount <= ZERO:
+            return update
+        return replace(update, filled_amount=update.filled_amount * size)
 
     async def fetch_funding_rates_percent(self, ct: CancellationToken | None = None) -> Mapping[str, Decimal]:
         now = self._clock.now()
@@ -693,6 +750,39 @@ def _option_text(value: Any) -> str:
     if isinstance(value, bool):
         return "True" if value else "False"
     return str(value)
+
+
+def _contract_size_of(market: Mapping[str, Any]) -> Decimal:
+    """Размер контракта рынка ccxt; у бирж, считающих объём в монетах, он 1 или не задан."""
+    raw = market.get("contractSize")
+    if isinstance(raw, (int, float)) and not isinstance(raw, bool) and raw > 0:
+        return to_dec(raw)
+    return ONE
+
+
+def _amount_step_of(market: Mapping[str, Any], tick_size_precision: bool) -> Decimal | None:
+    """Шаг объёма в единицах биржи: precision.amount — сам шаг (TICK_SIZE) или число знаков (DECIMAL_PLACES)."""
+    raw = (market.get("precision") or {}).get("amount")
+    if not isinstance(raw, (int, float)) or isinstance(raw, bool):
+        return None
+    if tick_size_precision:
+        return to_dec(raw) if raw > 0 else None
+    return Decimal(1).scaleb(-int(raw)) if raw >= 0 else None
+
+
+_BOOK_LIMITS: dict[str, tuple[int, ...]] = {
+    # биржи, которые принимают только фиксированные глубины стакана
+    "bingx": (5, 10, 20, 50, 100),
+    "binanceusdm": (5, 10, 20, 50, 100),
+    "kucoinfutures": (20, 100),
+}
+
+
+def _book_limit(exchange_id: str, depth: int) -> int:
+    allowed = _BOOK_LIMITS.get(exchange_id.lower())
+    if allowed is None:
+        return depth
+    return next((v for v in allowed if v >= depth), allowed[-1])
 
 
 def _to_pct(fraction: Any) -> Decimal:

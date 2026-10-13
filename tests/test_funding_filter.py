@@ -223,6 +223,8 @@ async def test_legs_within_skew_limit_still_make_a_signal():
 
 async def test_quote_age_of_signal_is_measured():
     h = await create()
+    h.options.symbols.max_ticker_age_seconds = 600
+    h.options.symbols.max_ticker_skew_seconds = 5
     # котировка дешёвой биржи снята на 2 с раньше «сейчас», дорогой — в «сейчас»
     h.long.tickers = {SYMBOL: ticker("binanceusdm", SYMBOL, bid=D("99.9"), ask=D(100), ts=NOW - timedelta(seconds=2))}
 

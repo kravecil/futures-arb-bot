@@ -28,8 +28,13 @@ class MarketInfo:
     is_linear: bool
     quote_currency: str
     min_amount: Decimal | None
+    """Минимальный объём заявки в базовой монете (уже пересчитан из контрактов)."""
     taker_percent: Decimal
     maker_percent: Decimal
+    contract_size: Decimal = Decimal(1)
+    """Сколько базовых монет в одном контракте биржи (OKX, Gate: часто ≠ 1). Ядро везде считает в монетах."""
+    amount_step: Decimal | None = None
+    """Шаг объёма заявки в базовой монете (шаг лота × размер контракта); None — неизвестен."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -116,6 +121,35 @@ class FetchTickersResult:
     latency: timedelta = field(default_factory=timedelta)
     source: str = "rest"
     """rest — свежий запрос REST; ws — котировки из потока; cache — недавний снимок REST без нового запроса."""
+
+
+@dataclass(frozen=True, slots=True)
+class OrderBookSnapshot:
+    """
+    Верх стакана биржи, полученный запросом REST: уровни (цена, объём в базовой монете),
+    asks — по возрастанию цены, bids — по убыванию.
+    """
+
+    exchange_id: str
+    symbol: str
+    bids: tuple[tuple[Decimal, Decimal], ...]
+    asks: tuple[tuple[Decimal, Decimal], ...]
+    timestamp: datetime | None = None
+
+    def sweep_price(self, side: OrderSide, amount: Decimal) -> Decimal | None:
+        """
+        Худшая цена уровня, до которого придётся «съесть» стакан, чтобы набрать amount:
+        BUY — по asks, SELL — по bids. None — глубины стакана не хватает.
+        """
+        levels = self.asks if side == OrderSide.BUY else self.bids
+        left = amount
+        for price, size in levels:
+            if price <= ZERO or size <= ZERO:
+                continue
+            left -= size
+            if left <= ZERO:
+                return price
+        return None
 
 
 @dataclass(frozen=True, slots=True)

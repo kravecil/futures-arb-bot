@@ -9,7 +9,7 @@ from decimal import Decimal
 from futures_arb_bot.core.cancellation import CancellationToken
 from futures_arb_bot.core.domain.arbitrage import OpportunityLeg, SpreadEstimate
 from futures_arb_bot.core.domain.enums import CloseReason, NetworkMode, OrderSide, OrderType
-from futures_arb_bot.core.domain.market_data import OrderResult
+from futures_arb_bot.core.domain.market_data import OrderResult, PositionSnapshot
 from futures_arb_bot.core.engine.connector_registry import ConnectorRegistry
 from futures_arb_bot.core.engine.statistics_collector import DefaultStatisticsCollector
 from futures_arb_bot.core.engine.trade_executor import ArbTradeExecutor
@@ -155,6 +155,7 @@ async def test_failed_rollback_leaves_position_tracked_for_maintenance():
         else OrderResult.ok(f"open-{index}", request.price, request.amount)  # лонг набран полностью
     )
     short_c.place_order_override = lambda _r, _i: OrderResult.fail("нет ликвидности")
+    long_c.open_positions = [PositionSnapshot("BTC/USDT:USDT", OrderSide.BUY, D(1), D(100))]  # биржа видит набранный лонг
 
     await executor.process_opportunities([estimate("BTC/USDT:USDT", D(100), D(101))], NONE)
 

@@ -7,17 +7,18 @@
 from __future__ import annotations
 
 import asyncio
+import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
-from decimal import Decimal
+from decimal import ROUND_CEILING, ROUND_FLOOR, ROUND_HALF_EVEN, Decimal
 
 from futures_arb_bot.core.abstractions import ConfigProvider, EventLog, ExchangeConnector, StatisticsCollector
 from futures_arb_bot.core.cancellation import CancellationToken, OperationCanceledError
 from futures_arb_bot.core.clock import Clock
 from futures_arb_bot.core.domain.arbitrage import PositionPair, SpreadEstimate
 from futures_arb_bot.core.domain.enums import CloseReason, NetworkMode, OrderSide, OrderType, PositionStatus, TimeInForce
-from futures_arb_bot.core.domain.market_data import MarketInfo, OrderRequest, TickerSnapshot
+from futures_arb_bot.core.domain.market_data import MarketInfo, OrderBookSnapshot, OrderRequest, TickerSnapshot
 from futures_arb_bot.core.domain.options import ArbitrageOptions
 from futures_arb_bot.core.domain.order_execution import (
     MARKET_ORDER,
@@ -37,6 +38,14 @@ _TEN_THOUSAND = Decimal(10_000)
 
 RECONCILE_INTERVAL = timedelta(seconds=60)
 """Период сверки фактической экспозиции с биржами (fetch_positions — приватный запрос)."""
+
+BOOK_REJECT_COOLDOWN = timedelta(seconds=10)
+"""Спред не подтвердился стаканом — столько не перепроверяем ту же связку (не спамим запросами и журналом)."""
+
+_FOUR_PLACES = Decimal("0.0001")
+
+_StreakKey = tuple[str, str, str]
+"""(символ, биржа лонга, биржа шорта)."""
 
 
 @dataclass(eq=False, slots=True)
@@ -143,6 +152,9 @@ class ArbTradeExecutor:
         self._last_reconcile_at: datetime | None = None
         self._last_tickers: dict[str, dict[str, TickerSnapshot]] = {}
         self._markets_cache: dict[str, dict[str, MarketInfo]] = {}
+        self._streaks: dict[_StreakKey, int] = {}
+        """Сколько сканов подряд связка держится выше порога входа (confirm_scans)."""
+        self._book_rejected_until: dict[_StreakKey, datetime] = {}
 
     @property
     def has_open_positions(self) -> bool:
@@ -155,6 +167,14 @@ class ArbTradeExecutor:
     # ------------------------- публичный цикл -------------------------
 
     async def process_opportunities(self, candidates: Sequence[SpreadEstimate], ct: CancellationToken) -> None:
+        # устойчивость сигнала: связка должна продержаться confirm_scans сканов подряд — одиночный
+        # «скачок» из-за запоздавшей котировки одной из бирж в сделку не превращается
+        self._streaks = {key: self._streaks.get(key, 0) + 1 for key in {_streak_key(c) for c in candidates}}
+        if not candidates:
+            return
+
+        required = max(1, self._config.current.arbitrage.confirm_scans)
+        candidates = [c for c in candidates if self._streaks.get(_streak_key(c), 0) >= required]
         if not candidates:
             return
 
@@ -307,6 +327,12 @@ class ArbTradeExecutor:
         if amount is None:
             return
 
+        if options.confirm_order_book:
+            confirmed = await self._confirm_with_order_books(estimate, amount, long_connector, short_connector, options, ct)
+            if confirmed is None:
+                return
+            estimate = confirmed
+
         if mode == NetworkMode.DRY_RUN:
             self._open_simulated(estimate, amount, options)
             return
@@ -385,6 +411,75 @@ class ArbTradeExecutor:
 
         # 4) успех — позиция с раздельными объёмами ног
         self._register_position(estimate, long_leg, short_leg)
+
+    async def _confirm_with_order_books(
+        self,
+        estimate: SpreadEstimate,
+        amount: Decimal,
+        long_connector: ExchangeConnector,
+        short_connector: ExchangeConnector,
+        options: ArbitrageOptions,
+        ct: CancellationToken,
+    ) -> SpreadEstimate | None:
+        """
+        Перепроверка сигнала по свежим стаканам обеих бирж (REST): цена, по которой реально наберётся
+        объём сделки, и тот же расчёт нетто, что у сканера. Не подтвердилось — None (сделки не будет).
+        Подтвердилось — оценка с ценами стакана: от них считаются цены заявок.
+        """
+        key = _streak_key(estimate)
+        now = self._clock.now()
+        until = self._book_rejected_until.get(key)
+        if until is not None and now < until:
+            return None
+
+        def reject(reason: str) -> None:
+            self._book_rejected_until[key] = now + BOOK_REJECT_COOLDOWN
+            self._log.info(f"{estimate.symbol}: {reason} — сделка не открывается")
+
+        depth = max(1, options.order_book_depth)
+        try:
+            long_book, short_book = await asyncio.wait_for(
+                asyncio.gather(
+                    long_connector.fetch_order_book(estimate.symbol, depth, ct),
+                    short_connector.fetch_order_book(estimate.symbol, depth, ct),
+                ),
+                timeout=options.order_book_timeout_ms / 1000,
+            )
+        except TimeoutError:
+            reject(f"стаканы не получены за {options.order_book_timeout_ms} мс")
+            return None
+
+        if long_book is None or short_book is None:
+            missing = long_connector.display_name if long_book is None else short_connector.display_name
+            reject(f"стакан {missing} недоступен")
+            return None
+
+        buy = _sweep(long_book, OrderSide.BUY, amount)
+        sell = _sweep(short_book, OrderSide.SELL, amount)
+        if buy is None or sell is None:
+            thin = long_connector.display_name if buy is None else short_connector.display_name
+            reject(f"в стакане {thin} не хватает глубины на {formatting.volume(amount)}")
+            return None
+
+        gross = (sell - buy) / buy * HUNDRED
+        fees = (estimate.long_leg.fee_percent + estimate.short_leg.fee_percent) * 2 if options.include_fees else ZERO
+        net = gross - fees - options.slippage_buffer_percent
+        if net < options.min_spread_percent_up:
+            reject(
+                f"спред не подтвердился стаканом: по котировкам нетто {formatting.pct(estimate.net_percent)}, "
+                f"по стакану {formatting.pct(net)} (купить {long_connector.id} @ {formatting.price(buy)}, "
+                f"продать {short_connector.id} @ {formatting.price(sell)})"
+            )
+            return None
+
+        self._book_rejected_until.pop(key, None)
+        return replace(
+            estimate,
+            long_leg=replace(estimate.long_leg, price=buy),
+            short_leg=replace(estimate.short_leg, price=sell),
+            gross_percent=gross.quantize(_FOUR_PLACES, rounding=ROUND_HALF_EVEN),
+            net_percent=net.quantize(_FOUR_PLACES, rounding=ROUND_HALF_EVEN),
+        )
 
     async def _place(self, leg: _LegState, ct: CancellationToken) -> bool:
         """Выставить заявку ноги. False — биржа отказала (нога мертва)."""
@@ -586,7 +681,9 @@ class ArbTradeExecutor:
             # добиваемся отмены: после cancel перечитываем финальное состояние (гонка отмены и исполнения)
             if not leg.done and not leg.dead and leg.order_id is not None:
                 attempt = 0
-                while attempt < 3 and not leg.dead:
+                # выходим, как только заявка мертва ИЛИ исполнена: повторный учёт уже свёрнутого
+                # исполнения удваивал объём ноги, и откат шёл на вдвое больший объём (reduceOnly отказ)
+                while attempt < 3 and not leg.dead and not leg.done:
                     await leg.connector.cancel_order(leg.order_id, leg.request.symbol, _NONE)
                     update = await leg.connector.fetch_order(leg.order_id, leg.request.symbol, _NONE, fresh=True)
                     if update is None or update.is_dead:
@@ -604,20 +701,37 @@ class ArbTradeExecutor:
                         leg.done = True
                     attempt += 1
 
-            # откат набранного — market reduceOnly с ретраями
+            # откат набранного — market reduceOnly с ретраями; объём не больше фактической позиции биржи
             remaining = leg.filled
+            if remaining > ZERO:
+                found, position_amount = await _exchange_position_amount(leg.connector, leg.request.symbol, leg.request.side)
+                if found and position_amount is not None:
+                    remaining = min(remaining, position_amount)
             close_side = OrderSide.SELL if leg.request.side == OrderSide.BUY else OrderSide.BUY
             attempt = 0
             while attempt < 3 and remaining > ZERO:
                 rollback = await leg.connector.place_order(OrderRequest(leg.request.symbol, close_side, remaining, reduce_only=True), _NONE)
                 if rollback.success:
-                    remaining -= rollback.filled_amount if rollback.filled_amount > ZERO else remaining
+                    done = rollback.filled_amount if rollback.filled_amount > ZERO else remaining
+                    price = f" @ {formatting.price(rollback.average_price)}" if rollback.average_price is not None else ""
+                    self._log.warning(
+                        f"[{leg.connector.display_name}] откат {close_side} {leg.request.symbol} × {formatting.volume(done)}{price} исполнен"
+                    )
+                    remaining -= done
                 else:
                     self._log.error(
                         f"[{leg.connector.display_name}] откат {close_side} {leg.request.symbol} × {dec_str(remaining)} "
                         f"не прошёл (попытка {attempt + 1}): {rollback.error}"
                     )
                     await asyncio.sleep(0.25)
+                    # отказ reduceOnly часто значит «позиция меньше, чем мы думаем» — сверяемся с биржей
+                    found, position_amount = await _exchange_position_amount(leg.connector, leg.request.symbol, leg.request.side)
+                    if found:
+                        if position_amount is None or position_amount <= ZERO:
+                            self._log.warning(f"[{leg.connector.display_name}] {leg.request.symbol}: позиции на бирже нет — откатывать нечего")
+                            remaining = ZERO
+                        else:
+                            remaining = min(remaining, position_amount)
                 attempt += 1
 
             residuals[i] = max(remaining, ZERO)
@@ -1038,19 +1152,30 @@ class ArbTradeExecutor:
     def _resolve_amount(
         self, long_connector: ExchangeConnector, short_connector: ExchangeConnector, estimate: SpreadEstimate, options: ArbitrageOptions
     ) -> Decimal | None:
+        """
+        Объём сделки в базовой монете, одинаковый для обеих ног: не меньше минимального объёма каждой биржи
+        и кратный шагу лота обеих (шаги уже пересчитаны из контрактов в монеты). Иначе биржа округлит
+        ноги по-разному, и «дельта-нейтральная» пара окажется с перекосом.
+        """
         amount = options.order_size_usd / estimate.long_leg.price
+        markets = [self._find_market(c, estimate.symbol) for c in (long_connector, short_connector)]
+        minimum = max((m.min_amount for m in markets if m is not None and m.min_amount is not None and m.min_amount > ZERO), default=ZERO)
+        step = _common_step([m.amount_step for m in markets if m is not None and m.amount_step is not None and m.amount_step > ZERO])
 
-        for connector, price in ((long_connector, estimate.long_leg.price), (short_connector, estimate.short_leg.price)):
-            market = self._find_market(connector, estimate.symbol)
-            if market is not None and market.min_amount is not None and market.min_amount > ZERO and amount < market.min_amount:
-                required_usd = market.min_amount * price
-                if required_usd > options.order_size_usd * 5:
-                    self._log.warning(
-                        f"{estimate.symbol}: минимальный объём на {connector.display_name} ({dec_str(market.min_amount)}) "
-                        f"требует ~{formatting.usd(required_usd)} — пропуск"
-                    )
-                    return None
-                amount = market.min_amount
+        amount = max(amount, minimum)
+        if step is not None:
+            floored = _round_to_step(amount, step, ROUND_FLOOR)
+            amount = floored if floored > ZERO and floored >= minimum else _round_to_step(amount, step, ROUND_CEILING)
+
+        price = max(estimate.long_leg.price, estimate.short_leg.price)
+        required_usd = amount * price
+        if required_usd > options.order_size_usd * 5:
+            step_text = f", общий шаг лота {dec_str(step)}" if step is not None else ""
+            self._log.warning(
+                f"{estimate.symbol}: минимальный объём сделки на обеих биржах ({dec_str(amount)}{step_text}) "
+                f"требует ~{formatting.usd(required_usd)} — пропуск"
+            )
+            return None
 
         return amount if amount > ZERO else None
 
@@ -1150,6 +1275,53 @@ class ArbTradeExecutor:
 
 
 # ------------------------- функции без состояния -------------------------
+
+
+def _streak_key(estimate: SpreadEstimate) -> _StreakKey:
+    return estimate.symbol, estimate.long_leg.exchange_id, estimate.short_leg.exchange_id
+
+
+def _sweep(book: OrderBookSnapshot, side: OrderSide, amount: Decimal) -> Decimal | None:
+    return book.sweep_price(side, amount)
+
+
+def _common_step(steps: Sequence[Decimal]) -> Decimal | None:
+    """Наименьший общий шаг лота (НОК десятичных шагов): объём, кратный ему, кратен шагу каждой биржи."""
+    result: Decimal | None = None
+    for raw in steps:
+        step = raw.normalize()
+        if step <= ZERO:
+            continue
+        if result is None:
+            result = step
+            continue
+        exponent = max(0, -int(result.as_tuple().exponent), -int(step.as_tuple().exponent))
+        scale = Decimal(10) ** exponent
+        a = int((result * scale).to_integral_value())
+        b = int((step * scale).to_integral_value())
+        if a <= 0 or b <= 0:
+            continue
+        result = (Decimal(math.lcm(a, b)) / scale).normalize()
+    return result
+
+
+def _round_to_step(amount: Decimal, step: Decimal, rounding: str) -> Decimal:
+    return (amount / step).to_integral_value(rounding=rounding) * step
+
+
+async def _exchange_position_amount(connector: ExchangeConnector, symbol: str, side: OrderSide) -> tuple[bool, Decimal | None]:
+    """
+    Фактический объём позиции ноги на бирже (side — сторона входа: Buy — лонг).
+    (False, None) — сверка не удалась; (True, None) — позиции нет; (True, объём) — есть.
+    """
+    try:
+        positions = await connector.fetch_positions(_NONE)
+    except OperationCanceledError:
+        raise
+    except Exception:
+        return False, None
+    amounts = [p.amount for p in positions if p.symbol == symbol and p.side == side and p.amount > ZERO]
+    return True, (sum(amounts, ZERO) if amounts else None)
 
 
 def _record_fill(leg: _LegState, current_order_filled: Decimal, price: Decimal | None, fee: Decimal | None = None) -> None:

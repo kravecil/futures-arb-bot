@@ -13,7 +13,7 @@ import asyncio
 import contextlib
 import time
 from collections.abc import Collection, Mapping
-from datetime import UTC, datetime
+from datetime import datetime
 from decimal import Decimal
 from typing import Any
 
@@ -105,14 +105,14 @@ class QuoteStream:
 
     def snapshot(self, volumes: Mapping[str, Decimal]) -> dict[str, TickerSnapshot]:
         """
-        Текущие котировки потока. Время котировки — «актуальна на момент»: поток лучших цен шлёт пару
-        только при изменении, поэтому пока соединение живо, неизменная цена актуальна на момент
-        последнего сообщения потока. Оборот за 24 ч берётся из последнего снимка REST.
+        Текущие котировки потока. Время котировки — момент, когда поток последний раз прислал
+        ИМЕННО ЭТУ пару (а не любую пару потока): иначе застывшая цена пары, по которой подписка
+        умолкла или которая пережила переподключение, выглядит свежей и рождает фантомный спред.
+        Неизменная пара честно стареет и отсекается фильтром max_ticker_age_seconds — для арбитража
+        лучше пропустить сделку, чем войти по старой цене. Оборот за 24 ч берётся из последнего снимка REST.
         """
-        alive_at = self._last_message_at
         result: dict[str, TickerSnapshot] = {}
-        for symbol, (bid, ask, last, stamp) in self._raw.items():
-            as_of = max(stamp, alive_at) if alive_at is not None else stamp
+        for symbol, (bid, ask, last, as_of) in self._raw.items():
             bid_d = to_dec(bid)
             result[symbol] = TickerSnapshot(
                 self._exchange_id, symbol, bid_d, to_dec(ask), to_dec(last) if last else bid_d, volumes.get(symbol, ZERO), as_of
@@ -140,6 +140,9 @@ class QuoteStream:
                 raise
             except Exception as ex:
                 failures += 1
+                # котировки пачки пережили обрыв — им больше нельзя верить: после переподключения
+                # в расчёт попадут только пары, по которым поток реально прислал новые цены
+                self._drop(chunk)
                 if not self._failing:
                     self._failing = True
                     self._log.warning(f"[{self._display_name}] поток котировок прерван: {message_of(ex)} — переподключаюсь")
@@ -153,6 +156,10 @@ class QuoteStream:
                 self._log.info(f"[{self._display_name}] поток котировок восстановлен")
             self._apply(updates)
 
+    def _drop(self, symbols: Collection[str]) -> None:
+        for symbol in symbols:
+            self._raw.pop(symbol, None)
+
     def _apply(self, updates: Any) -> None:
         if not isinstance(updates, Mapping):
             return
@@ -165,8 +172,9 @@ class QuoteStream:
             ask = ticker.get("ask")
             if not isinstance(bid, (int, float)) or not isinstance(ask, (int, float)) or bid <= 0 or ask <= 0:
                 continue
-            ms = ticker.get("timestamp")
-            stamp = datetime.fromtimestamp(ms / 1000, UTC) if isinstance(ms, (int, float)) and ms > 0 else received
+            # время котировки — момент её получения: метка биржи у части каналов — время последней
+            # сделки, а не стакана, и вдобавок зависит от расхождения часов
+            stamp = received
             last = ticker.get("last")
             self._raw[symbol] = (float(bid), float(ask), float(last) if isinstance(last, (int, float)) else None, stamp)
             applied = True

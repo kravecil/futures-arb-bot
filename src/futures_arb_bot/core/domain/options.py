@@ -157,6 +157,14 @@ class ArbitrageOptions(ConfigModel):
     max_positions_per_exchange: int = 4
     max_position_age_minutes: int = 720
     close_positions_on_exit: bool = True
+    confirm_scans: int = 2
+    """Сколько сканов подряд спред должен держаться выше порога, прежде чем открывать сделку (1 — сразу)."""
+    confirm_order_book: bool = True
+    """Перед открытием перепроверить спред по стаканам обеих бирж (запрос REST) с учётом глубины под объём сделки."""
+    order_book_depth: int = 20
+    """Сколько уровней стакана запрашивать для проверки."""
+    order_book_timeout_ms: int = 1_500
+    """Не дождались стаканов за это время — сделка не открывается."""
 
 
 class SymbolsOptions(ConfigModel):
@@ -167,8 +175,10 @@ class SymbolsOptions(ConfigModel):
     include: list[str] = Field(default_factory=list)
     exclude: list[str] = Field(default_factory=list)
     max_symbols: int = 400
-    max_ticker_age_seconds: int = 15
-    max_ticker_skew_seconds: int = 5
+    max_ticker_age_seconds: float = 2.0
+    """Котировка старше этого (по времени её собственного обновления) не участвует в расчёте, с."""
+    max_ticker_skew_seconds: float = 0.5
+    """Котировки двух бирж, снятые с разницей больше этого, не сравниваются, с."""
 
     @field_validator("quote_currencies", "include", "exclude", mode="before")
     @classmethod

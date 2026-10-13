@@ -57,3 +57,9 @@ arbitrage:
   max_positions_per_exchange: 2
   max_position_age_minutes: 720
   close_positions_on_exit: true
+
+  # Защита входа от фантомных спредов (устаревшая котировка одной из бирж):
+  confirm_scans: 2              # спред должен продержаться столько сканов подряд (1 — входить сразу)
+  confirm_order_book: true      # перед входом перепроверить спред по стаканам обеих бирж (REST)
+  order_book_depth: 20          # уровней стакана для проверки
+  order_book_timeout_ms: 1500   # стаканы не пришли за это время — сделка не открывается

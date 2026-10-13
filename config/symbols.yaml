@@ -8,8 +8,8 @@ symbols:
   quote_currencies: [USDT]
   min_quote_volume24h_usd: 5000000
   max_symbols: 400
-  max_ticker_age_seconds: 15
-  max_ticker_skew_seconds: 5
+  max_ticker_age_seconds: 2      # котировка старше — не участвует в расчёте, с
+  max_ticker_skew_seconds: 0.5   # котировки двух бирж с разницей во времени больше — не сравниваются, с
   include: []
   exclude:
     - "*ONE/USDT:*"

@@ -15,6 +15,7 @@ from futures_arb_bot.core.domain.market_data import (
     ExchangeFees,
     FetchTickersResult,
     MarketInfo,
+    OrderBookSnapshot,
     OrderRequest,
     OrderResult,
     OrderUpdate,
@@ -33,7 +34,12 @@ class FakeConfigProvider:
     """Тестовый конфиг-провайдер без файловой системы (одни и те же настройки на каждый доступ)."""
 
     def __init__(self, options: BotOptions | None = None) -> None:
-        self._options = options or BotOptions()
+        if options is None:
+            options = BotOptions()
+            # исторические тесты проверяют решение одного скана; подтверждение сканами — в test_entry_confirmation
+            options.arbitrage.confirm_scans = 1
+            options.arbitrage.confirm_order_book = False
+        self._options = options
 
     @property
     def current(self) -> BotOptions:
@@ -118,6 +124,9 @@ class FakeConnector:
         self.market_data = None
         self.orders = None
         self.fetch_calls: list[tuple[str, bool]] = []
+        self.order_books: dict[str, OrderBookSnapshot | None] = {}
+        """Стакан по символу; не задан — строится из тикера с большой глубиной."""
+        self.order_book_calls: list[str] = []
 
     @property
     def id(self) -> str:
@@ -225,6 +234,16 @@ class FakeConnector:
             raise RuntimeError("сверка позиций недоступна")
         return list(self.open_positions)
 
+    async def fetch_order_book(self, symbol: str, depth: int, ct: CancellationToken | None = None) -> OrderBookSnapshot | None:
+        self.order_book_calls.append(symbol)
+        if symbol in self.order_books:
+            return self.order_books[symbol]
+        quote = self.tickers.get(symbol)
+        if quote is None:
+            return None
+        deep = D(1_000_000_000)
+        return OrderBookSnapshot(self._id, symbol, ((quote.bid, deep),), ((quote.ask, deep),), quote.timestamp)
+
     async def cancel_order(self, order_id: str, symbol: str, ct: CancellationToken | None = None) -> bool:
         if self.cancel_order_override is not None and self.cancel_order_override(order_id) is False:
             return False
@@ -310,7 +329,8 @@ class FakeExecutor:
         return False
 
     async def process_opportunities(self, candidates: Sequence[SpreadEstimate], ct: CancellationToken) -> None:
-        self.processed_batches.append(list(candidates))
+        if candidates:
+            self.processed_batches.append(list(candidates))
 
     async def manage_open_positions(self, tickers_by_exchange: Mapping[str, Mapping[str, TickerSnapshot]], ct: CancellationToken) -> None:
         return None

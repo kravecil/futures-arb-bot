@@ -13,6 +13,7 @@ from futures_arb_bot.core.domain.market_data import (
     ExchangeFees,
     FetchTickersResult,
     MarketInfo,
+    OrderBookSnapshot,
     OrderRequest,
     OrderResult,
     OrderUpdate,
@@ -129,6 +130,10 @@ class ExchangeConnector(Protocol):
     def start_order_stream(self, orders: OrdersOptions) -> bool: ...
 
     async def fetch_positions(self, ct: CancellationToken | None = None) -> list[PositionSnapshot]: ...
+
+    async def fetch_order_book(self, symbol: str, depth: int, ct: CancellationToken | None = None) -> OrderBookSnapshot | None:
+        """Верх стакана (REST), объёмы — в базовой монете. None — стакан недоступен."""
+        ...
 
     async def fetch_funding_rates_percent(self, ct: CancellationToken | None = None) -> Mapping[str, object]: ...
 

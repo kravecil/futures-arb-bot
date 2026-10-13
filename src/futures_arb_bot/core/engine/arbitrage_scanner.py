@@ -155,7 +155,8 @@ class DefaultArbitrageScanner:
         self._log_signals(candidates)
         self._notify_signals(candidates)
 
-        if options.arbitrage.enabled and candidates:
+        if options.arbitrage.enabled:
+            # и с пустым списком: исполнитель так узнаёт, что связка пропала, и сбрасывает счётчик подтверждений
             await self._executor.process_opportunities(candidates, ct)
 
         if options.arbitrage.enabled or self._executor.has_open_positions:
