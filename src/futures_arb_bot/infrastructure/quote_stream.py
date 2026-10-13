@@ -17,6 +17,8 @@ from datetime import datetime
 from decimal import Decimal
 from typing import Any
 
+import ccxt
+
 from futures_arb_bot.core.abstractions import EventLog
 from futures_arb_bot.core.clock import Clock
 from futures_arb_bot.core.domain.market_data import TickerSnapshot
@@ -28,6 +30,11 @@ CHUNK_SIZE = 50
 """Пар на одну подписку: большие пакеты биржи иногда отвергают, мелкие — плодят задачи."""
 
 _BACKOFF_SECONDS = (1.0, 2.0, 5.0, 10.0)
+
+_QUOTE_HASH_PREFIXES = ("bidask", "ticker")
+"""Префиксы ключей ожидания ccxt у подписок на лучшие цены и тикеры (watch_bids_asks / watch_tickers)."""
+
+_MAX_RECONNECT_GAP_SECONDS = 60.0
 
 
 class QuoteStream:
@@ -53,6 +60,9 @@ class QuoteStream:
         self._started_at: float | None = None
         self._messages = 0
         self._failing = False
+        self._forced_at: float | None = None
+        self._forced_gap: float | None = None
+        self._forced_total = 0
 
     @property
     def supported(self) -> bool:
@@ -119,6 +129,44 @@ class QuoteStream:
             )
         return result
 
+    @property
+    def forced_reconnects(self) -> int:
+        """Сколько раз за сеанс соединение котировок сбрасывалось сторожевым таймером."""
+        return self._forced_total
+
+    def force_reconnect(self, silent_seconds: float, min_gap_seconds: float) -> int:
+        """
+        Сбросить «зависшие» WebSocket-соединения котировок: соединение не закрыто, но данные не идут,
+        а ccxt заметит это только по пропущенному ping-pong (у OKX/Bybit ~36 с). Сброс идёт тем же
+        путём, что и тайм-аут ping-pong ccxt: ожидания отклоняются, соединение закрывается, следующий
+        watch_* открывает новое. Повторный сброс — не раньше min_gap_seconds, а пока поток молчит,
+        пауза между сбросами удваивается (до минуты). Возвращает число сброшенных соединений
+        (0 — рано или сбрасывать нечего).
+        """
+        now = time.monotonic()
+        gap = self._forced_gap if self._forced_gap is not None else min_gap_seconds
+        if self._forced_at is not None and now - self._forced_at < gap:
+            return 0
+
+        clients = getattr(self._api, "clients", None) or {}
+        reset = 0
+        for client in list(clients.values()):
+            if not _is_quote_client(client):
+                continue
+            on_error = getattr(client, "on_error", None)
+            if on_error is None:
+                continue
+            try:
+                on_error(ccxt.RequestTimeout(f"поток котировок молчит {silent_seconds:.0f} с — соединение сброшено сторожевым таймером"))
+                reset += 1
+            except Exception as ex:
+                self._logger.debug("force reconnect failed", exc_info=ex)
+
+        self._forced_at = now
+        self._forced_gap = min(gap * 2, _MAX_RECONNECT_GAP_SECONDS) if self._forced_gap is not None else min_gap_seconds * 2
+        self._forced_total += reset
+        return reset
+
     async def aclose(self) -> None:
         tasks, self._tasks = self._tasks, []
         for task in tasks:
@@ -179,6 +227,16 @@ class QuoteStream:
             self._raw[symbol] = (float(bid), float(ask), float(last) if isinstance(last, (int, float)) else None, stamp)
             applied = True
         if applied:
+            self._forced_gap = None  # поток ожил — следующий сброс снова через обычную паузу
             self._messages += 1
             self._last_message = time.monotonic()
             self._last_message_at = received
+
+
+def _is_quote_client(client: Any) -> bool:
+    """WebSocket-клиент ccxt, через который идут наши котировки (а не, например, поток своих заявок)."""
+    for attribute in ("futures", "subscriptions"):
+        keys = getattr(client, attribute, None)
+        if isinstance(keys, Mapping) and any(str(k).startswith(_QUOTE_HASH_PREFIXES) for k in keys):
+            return True
+    return False

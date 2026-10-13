@@ -223,6 +223,15 @@ class CcxtExchangeConnector:
         """Актуальные настройки источника котировок (перечитываются сканером каждый тик)."""
         self._market_data = market_data
         self._refresh_interval_ms = refresh_interval_ms
+        self._apply_keep_alive(market_data.keep_alive_ms)
+
+    def _apply_keep_alive(self, keep_alive_ms: int) -> None:
+        """Период ping-pong для новых WebSocket-соединений ccxt (действующие получат его при переподключении)."""
+        if keep_alive_ms <= 0:
+            return
+        streaming = getattr(self._api, "streaming", None)
+        if isinstance(streaming, dict) and streaming.get("keepAlive") != keep_alive_ms:
+            self._api.streaming = {**streaming, "keepAlive": keep_alive_ms}
 
     def subscribe_quotes(self, symbols: Collection[str]) -> list[str]:
         """Подписаться на лучшие цены пар (добавляются только новые). Возвращает новые пары."""
@@ -253,6 +262,11 @@ class CcxtExchangeConnector:
             if not self._stream_down_logged and silent is not None and silent * 1000 >= md.stale_after_ms:
                 self._stream_down_logged = True
                 self._log.warning(f"[{self.display_name}] поток котировок молчит {silent:.0f} с — котировки по REST до его восстановления")
+
+            if md.reconnect_after_ms > 0 and silent is not None and silent * 1000 >= md.reconnect_after_ms:
+                reset = stream.force_reconnect(silent, md.reconnect_after_ms / 1000)
+                if reset > 0:
+                    self._log.warning(f"[{self.display_name}] поток котировок молчит {silent:.0f} с — переподключаю принудительно")
 
             recent = self._rest_at is not None and (time.monotonic() - self._rest_at) * 1000 < self._refresh_interval_ms
             if self._rest_result is not None and recent:

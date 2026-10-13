@@ -32,6 +32,7 @@ from futures_arb_bot.core.domain.statistics import DashboardSnapshot
 from futures_arb_bot.core.engine import formatting
 from futures_arb_bot.core.engine.connector_registry import ConnectorRegistry
 from futures_arb_bot.core.engine.logging_bridge import get_logger
+from futures_arb_bot.core.engine.spread_report import SpreadReporter
 from futures_arb_bot.core.errors import message_of
 
 _FALLBACK_FEES = ExchangeFees(Decimal("0.1"), Decimal("0.05"))
@@ -73,6 +74,8 @@ class DefaultArbitrageScanner:
         self._streaming = False
         self._no_stream_logged: set[str] = set()
         self._prepared = False
+        self._spread_report = SpreadReporter(log, clock)
+        self._compared_pairs = 0
 
     @property
     def snapshot(self) -> DashboardSnapshot | None:
@@ -121,6 +124,8 @@ class DefaultArbitrageScanner:
 
         estimates, tracked_symbols = self._evaluate(fetched, funding, options)
         tick_ms = (time.monotonic() - tick_started) * 1000
+        self._spread_report.tick(self._compared_pairs)
+        self._spread_report.maybe_report(options)
 
         self._stats.record_scan_tick(total_fetched)
         self._stats.record_tick_duration(tick_ms)
@@ -300,6 +305,8 @@ class DefaultArbitrageScanner:
             tracked_symbols = len(cross_exchange)
 
         estimates: list[SpreadEstimate] = []
+        self._compared_pairs = 0
+        arbitrage = options.arbitrage
         for symbol, quotes, _ in cross_exchange:
             cheaper: TickerSnapshot | None = None
             richer: TickerSnapshot | None = None
@@ -316,6 +323,24 @@ class DefaultArbitrageScanner:
             # больше чем на max_ticker_skew_seconds, расхождение мог породить сдвиг рынка — пропускаем
             if cheaper.timestamp is not None and richer.timestamp is not None and abs(cheaper.timestamp - richer.timestamp) > max_skew:
                 continue
+
+            # для отчёта о спредах — каждая сравнимая пара, даже без прибыли (видно, далеко ли рынок от порога)
+            self._compared_pairs += 1
+            if cheaper.ask > 0 and richer.bid > cheaper.ask:
+                gross = (richer.bid - cheaper.ask) / cheaper.ask * 100
+                cheap_fees = self._fees_of(cheaper.exchange_id, symbol)
+                rich_fees = self._fees_of(richer.exchange_id, symbol)
+                fee_cost = (cheap_fees.taker_percent + rich_fees.taker_percent) * 2 if arbitrage.include_fees else Decimal(0)
+                self._spread_report.observe(
+                    symbol,
+                    cheaper.exchange_id,
+                    richer.exchange_id,
+                    cheaper.ask,
+                    richer.bid,
+                    gross,
+                    gross - fee_cost - arbitrage.slippage_buffer_percent,
+                    anomaly=gross > arbitrage.max_spread_percent,
+                )
 
             estimate = self._calculator.calculate(
                 cheaper, richer, self._fees_of(cheaper.exchange_id, symbol), self._fees_of(richer.exchange_id, symbol)

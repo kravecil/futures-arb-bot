@@ -13,6 +13,10 @@ general:
     scan_interval_ms: 100       # WebSocket: как часто пересчитывать спреды по свежим котировкам
     stale_after_ms: 3000        # поток молчит дольше — котировки биржи по REST (раз в refresh_interval_ms)
     volume_refresh_seconds: 60  # обновление оборотов за 24 ч и набора подписок по REST
+    reconnect_after_ms: 5000    # поток молчит дольше — сбросить соединение и открыть заново (0 — не вмешиваться)
+    keep_alive_ms: 5000         # период ping-pong WebSocket ccxt (0 — как в ccxt, у OKX/Bybit 18 с)
+    spread_report_seconds: 60   # раз в N с писать в журнал лучшие спреды за период (0 — не писать)
+    spread_report_top: 5        # сколько лучших связок в этом отчёте
   orders:
     updates: WebSocket          # статусы своих заявок: WebSocket (watch_orders, с проверкой REST) | Rest (опрос)
     transport: WebSocket        # выставление/отмена: WebSocket (create/cancel_order_ws, где есть в ccxt) | Rest
