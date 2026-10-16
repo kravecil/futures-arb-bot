@@ -13,6 +13,10 @@ from futures_arb_bot.core.abstractions import EventLog, ExchangeConnector
 from futures_arb_bot.core.clock import Clock
 from futures_arb_bot.core.domain.enums import NetworkMode
 from futures_arb_bot.core.domain.options import ExchangeConfigEntry
+from futures_arb_bot.infrastructure import ccxt_ws_patch
+
+# до создания первой биржи: иначе WebSocket ccxt «засыпает» при потоке котировок пачками (см. модуль)
+ccxt_ws_patch.apply()
 
 SUPPORTED = (
     "binanceusdm",

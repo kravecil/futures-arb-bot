@@ -543,6 +543,8 @@ uv run python scripts/ws_diag.py                 # то же без робота
 
 Вывод сразу пишется в файлы (копировать из терминала не нужно): `logs/ws-diag-*.log` — общая хронология, `logs/ws-diag-*-summary.txt` — сводка и вывод, `logs/ws-diag-*-bot.log` — полный вывод робота. Параметры: `--minutes 60`, `--symbols BTC,ETH` (по умолчанию `auto` — как у робота), `--exchanges okx,gate`, `--freeze 3`, `--lag-ms 200`, `--bot-args "--config-dir ./config"`, `--proxy http://…`, `--no-ccxt`, `--out-dir`, `--no-files`; `--help` — все. «Сырые» каналы есть для Bybit, OKX и Gate; для остальных бирж — только канал ccxt.
 
+**Заплатка ccxt для WebSocket.** ccxt 4.5.x на aiohttp 3.14 «засыпает» на потоке сообщений пачками: его `receive_loop` выгребает внутреннюю очередь aiohttp и неверно правит её счётчик (не учитывает надбавку 128 байт на сообщение), счётчик дорастает до лимита — и aiohttp навсегда ставит чтение сокета на паузу. Соединение открыто, биржа шлёт данные, а робот их не видит: поток котировок молчит каждые 10–30 с, тем чаще, чем больше пар. Робот при старте подменяет `receive_loop` на чтение через публичный `receive()` (`infrastructure/ccxt_ws_patch.py`, ставится в `ccxt_factory`). Тест `tests/test_ccxt_ws_patch.py` воспроизводит ошибку на локальном сервере; когда ccxt её исправит, тест `test_original_ccxt_receive_loop_still_stalls` упадёт — значит, заплатку можно удалить.
+
 ## Разработка
 
 ```bash

@@ -271,6 +271,8 @@ class DiagLog:
                 self.stats.errors.append(message.split("прерван:", 1)[-1].strip())
             elif "поток котировок восстановлен" in message:
                 self.stats.connects += 1
+                self.stats.connected_at = time.monotonic()  # «через N с после переподключения» — от этого момента
+                self.stats.froze_this_connection = False
         self._out.line(f"[{self._prefix}] {message}", console=text in ("warning", "error"))
 
     def latest(self, count: int) -> list[Any]:
@@ -1043,6 +1045,16 @@ async def main(args: argparse.Namespace) -> int:
         f"настройки робота: keep_alive_ms {md.keep_alive_ms}, reconnect_after_ms {md.reconnect_after_ms}, stale_after_ms {md.stale_after_ms}, "
         f"scan_interval_ms {md.scan_interval_ms}"
     )
+    try:
+        from futures_arb_bot.infrastructure import (
+            ccxt_factory,  # noqa: F401 — ставит заплатку чтения WebSocket ccxt
+            ccxt_ws_patch,
+        )
+
+        patched = ccxt_ws_patch.is_applied()
+    except ImportError:
+        patched = False
+    out.line(f"заплатка чтения WebSocket ccxt (ccxt_ws_patch): {'действует' if patched else 'НЕТ — ccxt может «засыпать» при пачках сообщений'}")
     if files:
         out.line(f"журнал: {out.main_path}; сводка: {out.summary_path}" + (f"; вывод робота: {bot_log_path}" if bot_log_path else ""))
 
