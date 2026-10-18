@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import os
+import re
 import time
 import uuid
 from collections.abc import Collection, Mapping
@@ -736,12 +737,33 @@ def explain_error(ex: BaseException) -> str:
     if isinstance(ex, ccxt.AuthenticationError):
         return "ошибка аутентификации (проверьте API-ключи)"
     if isinstance(ex, ccxt.InvalidOrder):
-        return "ордер отклонён биржей (объём или цена)"
+        # исходный ответ биржи (код и текст) нужен, чтобы отличить «нет позиции под reduce-only» от лота/цены
+        detail = exchange_error_detail(ex)
+        return f"ордер отклонён биржей (объём или цена): {detail}" if detail else "ордер отклонён биржей (объём или цена)"
     if isinstance(ex, ccxt.BadSymbol):
         return "неизвестный инструмент"
     if isinstance(ex, ccxt.NetworkError):
         return "сетевая ошибка"
     return f"{type(ex).__name__}: {ex}"
+
+
+_ERROR_CODE = re.compile(r'"(?:retCode|code|sCode|label)"\s*:\s*"?(-?[\w.]+)')
+_ERROR_TEXT = re.compile(r'"(?:retMsg|msg|sMsg|message)"\s*:\s*"([^"]+)"')
+
+
+def exchange_error_detail(ex: BaseException, limit: int = 200) -> str:
+    """
+    Короткая выжимка ответа биржи из исключения ccxt: «110017 current position is zero…» для JSON-ответов
+    (Bybit retCode/retMsg, OKX code/msg и sCode/sMsg), иначе начало текста исключения.
+    """
+    text = str(ex).strip()
+    codes = [c for c in _ERROR_CODE.findall(text) if c not in ("0", "")]
+    messages = [m for m in _ERROR_TEXT.findall(text) if m.strip()]
+    if codes or messages:
+        detail = " ".join(part for part in (codes[-1] if codes else None, messages[-1] if messages else None) if part)
+    else:
+        detail = text
+    return detail if len(detail) <= limit else detail[: limit - 1] + "…"
 
 
 def _is_cancel(ex: BaseException) -> bool:

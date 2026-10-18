@@ -42,6 +42,18 @@ RECONCILE_INTERVAL = timedelta(seconds=60)
 BOOK_REJECT_COOLDOWN = timedelta(seconds=10)
 """Спред не подтвердился стаканом — столько не перепроверяем ту же связку (не спамим запросами и журналом)."""
 
+POSITION_SETTLE_DELAY_SECONDS = 0.7
+"""Пауза перед повторной сверкой позиции: биржа (Bybit) показывает позицию с задержкой после исполнения."""
+
+CLOSE_RETRY_BASE = timedelta(seconds=1)
+"""Пауза после первой неудачной попытки закрытия; дальше удваивается."""
+
+CLOSE_RETRY_MAX = timedelta(seconds=30)
+"""Предельная пауза между повторами закрытия."""
+
+CLOSE_ALERT_AFTER = 10
+"""Столько неудачных попыток закрытия подряд — громкое предупреждение (и далее каждые 100)."""
+
 _FOUR_PLACES = Decimal("0.0001")
 
 _StreakKey = tuple[str, str, str]
@@ -126,6 +138,15 @@ class _CloseLegResult:
     """Комиссия закрывающей заявки; None — оценить по taker."""
 
 
+@dataclass(slots=True)
+class _CloseAttempts:
+    """Начатое закрытие позиции: причина и счётчик неудач для паузы между повторами."""
+
+    reason: CloseReason
+    failures: int = 0
+    retry_at: datetime | None = None
+
+
 class ArbTradeExecutor:
     def __init__(
         self,
@@ -155,6 +176,9 @@ class ArbTradeExecutor:
         self._streaks: dict[_StreakKey, int] = {}
         """Сколько сканов подряд связка держится выше порога входа (confirm_scans)."""
         self._book_rejected_until: dict[_StreakKey, datetime] = {}
+        self._close_attempts: dict[str, _CloseAttempts] = {}
+        """Позиции, закрытие которых начато, но не завершено (символ → причина и повторы)."""
+        self._position_settle_delay = POSITION_SETTLE_DELAY_SECONDS
 
     @property
     def has_open_positions(self) -> bool:
@@ -219,6 +243,14 @@ class ArbTradeExecutor:
         to_rebalance: list[PositionPair] = []
 
         for position in list(self._positions.values()):
+            pending = self._close_attempts.get(position.symbol)
+            if pending is not None:
+                # закрытие уже начато: доводим его до конца независимо от текущего спреда — иначе
+                # наполовину закрытая пара (голая нога) ждала бы, пока условие выхода случайно повторится
+                if pending.retry_at is None or now >= pending.retry_at:
+                    to_close.append((position, pending.reason))
+                continue
+
             long_ticker = self._find_ticker(position.long_exchange_id, position.symbol)
             short_ticker = self._find_ticker(position.short_exchange_id, position.symbol)
             if long_ticker is None or short_ticker is None or not long_ticker.is_tradable or not short_ticker.is_tradable:
@@ -239,6 +271,11 @@ class ArbTradeExecutor:
                 reason = None
 
             if reason is not None:
+                held_minutes = int((now - position.opened_at).total_seconds() // 60)
+                self._log.info(
+                    f"Закрываю арбитраж {position.symbol} ({_describe_reason(reason)}): брутто сейчас {formatting.pct(current_gross)}, "
+                    f"расчётный PnL выхода {formatting.pct(net_now)}, позиция открыта {held_minutes} мин"
+                )
                 to_close.append((position, reason))
                 continue
 
@@ -1014,6 +1051,7 @@ class ArbTradeExecutor:
         остатка по таймауту. Объём 0 в результате — нога не закрыта.
         """
         side = OrderSide.SELL if is_long else OrderSide.BUY
+        exposure_side = OrderSide.BUY if is_long else OrderSide.SELL
         policy = self._resolve_policy(connector, options, close=True)
 
         if policy.requires_price and not (reference is not None and reference > ZERO):
@@ -1024,6 +1062,16 @@ class ArbTradeExecutor:
         leg = self._build_leg(connector, policy, position.symbol, side, reference if reference is not None else ZERO, size, reduce_only=True)
         # закрытие ноги не обрывается остановкой: начатое закрытие должно попасть в учёт
         if not await self._place(leg, _NONE):
+            # отказ reduce-only часто означает «позиции уже нет» (её закрыла прошлая заявка, чей статус
+            # не дошёл, — SAND 18.10.2026): без сверки с биржей нога навсегда остаётся в учёте фантомом
+            remaining = await self._settled_exchange_position(connector, exposure_side, position.symbol)
+            if remaining is not None and remaining < size:
+                closed = size - remaining
+                self._log.warning(
+                    f"[{connector.display_name}] {position.symbol}: заявка закрытия отклонена, но позиция на бирже "
+                    f"{formatting.volume(remaining)} из {formatting.volume(size)} — учитываю закрытым {formatting.volume(closed)}"
+                )
+                return _CloseLegResult(closed, None, None)
             return _CloseLegResult(ZERO, None, leg.error or "заявка отклонена")
 
         # market-заявку не опрашиваем: она обязана исполниться сразу
@@ -1048,15 +1096,53 @@ class ArbTradeExecutor:
                 closed = size  # статус «исполнен», но объёма биржа не вернула — доверяем статусу
 
             if closed <= ZERO:
-                exposure_side = OrderSide.BUY if side == OrderSide.SELL else OrderSide.SELL
-                if await _has_exchange_position(connector, exposure_side, position.symbol, _NONE):
+                # статус неясен — решает фактическая позиция (с повторной сверкой: биржа обновляет её с задержкой)
+                remaining = await self._settled_exchange_position(connector, exposure_side, position.symbol)
+                if remaining is None or remaining >= size:
                     error = "рыночная заявка не подтверждена биржей" if update is None else f"рыночная заявка не исполнена (статус: {update.status})"
                     return _CloseLegResult(ZERO, leg.average_price, error)
 
-                closed = size  # позиции на бирже нет — нога действительно закрыта
+                closed = size - remaining  # позиции на бирже нет (или меньше) — нога закрыта на разницу
 
         # комиссию берём по заявке, если по ней есть исполнение; «закрыто по факту отсутствия позиции» — оценка
         return _CloseLegResult(closed, leg.average_price, leg.error, leg.fee_quote if leg.filled > ZERO else None)
+
+    async def _settled_exchange_position(self, connector: ExchangeConnector, exposure_side: OrderSide, symbol: str) -> Decimal | None:
+        """
+        Фактический объём позиции ноги на бирже (в базовой монете). Если позиция видна, сверка повторяется
+        через паузу: сразу после исполнения биржа может ещё отдавать старый снимок. None — сверка недоступна.
+        """
+        amount = ZERO
+        for attempt in range(2):
+            try:
+                positions = await connector.fetch_positions(_NONE)
+            except OperationCanceledError:
+                raise
+            except Exception as ex:
+                self._logger.debug(f"FetchPositions on {connector.id} failed", exc_info=ex)
+                return None
+
+            amount = sum((p.amount for p in positions if p.symbol == symbol and p.side == exposure_side and p.amount > ZERO), ZERO)
+            if amount <= ZERO or attempt > 0:
+                break
+            await asyncio.sleep(self._position_settle_delay)
+        return amount
+
+    def _register_close_failure(self, position: PositionPair) -> timedelta:
+        """Неудачная попытка закрытия: пауза до следующей (1, 2, 4 … 30 с) и предупреждение при затяжных отказах."""
+        attempts = self._close_attempts.get(position.symbol)
+        if attempts is None:
+            return timedelta(0)
+
+        attempts.failures += 1
+        delay = min(CLOSE_RETRY_MAX, CLOSE_RETRY_BASE * (2 ** min(attempts.failures - 1, 10)))
+        attempts.retry_at = self._clock.now() + delay
+        if attempts.failures == CLOSE_ALERT_AFTER or (attempts.failures > CLOSE_ALERT_AFTER and attempts.failures % 100 == 0):
+            self._log.error(
+                f"ВНИМАНИЕ: {position.symbol} не закрывается {attempts.failures} попыток подряд — проверьте позиции "
+                f"на {position.long_exchange_id}/{position.short_exchange_id} вручную; повтор раз в {int(CLOSE_RETRY_MAX.total_seconds())} с"
+            )
+        return delay
 
     async def _close(self, position: PositionPair, reason: CloseReason, ct: CancellationToken) -> None:
         """
@@ -1068,6 +1154,9 @@ class ArbTradeExecutor:
         short_connector = self._registry.find(position.short_exchange_id)
         if long_connector is None or short_connector is None:
             return
+
+        # закрытие начато: дальше оно повторяется до конца (с паузами), даже если условие выхода пропадёт
+        self._close_attempts.setdefault(position.symbol, _CloseAttempts(reason))
 
         long_ticker = self._find_ticker(position.long_exchange_id, position.symbol)
         short_ticker = self._find_ticker(position.short_exchange_id, position.symbol)
@@ -1091,9 +1180,10 @@ class ArbTradeExecutor:
                         position, long_connector, True, position.long_size, long_ticker.bid if long_ticker is not None else None, options, ct
                     )
                     if result.closed <= ZERO:
+                        delay = self._register_close_failure(position)
                         self._log.error(
                             f"[{long_connector.display_name}] закрытие лонга {position.symbol} не удалось: "
-                            f"{result.error or 'заявка не исполнена'} — повторю на следующем тике"
+                            f"{result.error or 'заявка не исполнена'} — повтор через {int(delay.total_seconds())} с"
                         )
                         return  # позиция остаётся в учёте, закроем позже
 
@@ -1115,10 +1205,11 @@ class ArbTradeExecutor:
                         position, short_connector, False, position.short_size, short_ticker.ask if short_ticker is not None else None, options, ct
                     )
                     if result.closed <= ZERO:
-                        # лонг уже закрыт — шорт остаётся голым, но позиция не теряется: повтор на следующем тике
+                        # лонг уже закрыт — шорт остаётся голым, но позиция не теряется: повтор после паузы
+                        delay = self._register_close_failure(position)
                         self._log.error(
                             f"[{short_connector.display_name}] закрытие шорта {position.symbol} не удалось: "
-                            f"{result.error or 'заявка не исполнена'} — позиция остаётся в учёте, повторю на следующем тике"
+                            f"{result.error or 'заявка не исполнена'} — позиция остаётся в учёте, повтор через {int(delay.total_seconds())} с"
                         )
                         return
 
@@ -1144,6 +1235,7 @@ class ArbTradeExecutor:
         position.realized_pnl_usd = accrued - position.fees_entry_usd - position.fees_exit_usd
 
         self._positions.pop(position.symbol, None)
+        self._close_attempts.pop(position.symbol, None)
         self._stats.record_closed(position)
         self._log.success(f"Закрыт арбитраж {position.symbol} ({_describe_reason(reason)}): PnL {formatting.usd(position.realized_pnl_usd)}")
 
@@ -1424,17 +1516,6 @@ def _accrue_closed_leg(
         position.closed_long_volume += quantity
     else:
         position.closed_short_volume += quantity
-
-
-async def _has_exchange_position(connector: ExchangeConnector, exposure_side: OrderSide, symbol: str, ct: CancellationToken) -> bool:
-    """Есть ли у биржи фактическая позиция ноги. Сбой сверки трактуем как «позиция есть»."""
-    try:
-        positions = await connector.fetch_positions(ct)
-        return any(p.symbol == symbol and p.side == exposure_side and p.amount > ZERO for p in positions)
-    except OperationCanceledError:
-        raise
-    except Exception:
-        return True
 
 
 def _first_not_none(*values: Decimal | None) -> Decimal:

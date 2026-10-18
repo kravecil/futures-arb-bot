@@ -16,7 +16,7 @@ from futures_arb_bot.core.engine.connector_registry import ConnectorRegistry
 from futures_arb_bot.core.engine.statistics_collector import DefaultStatisticsCollector
 from futures_arb_bot.core.engine.trade_executor import ArbTradeExecutor
 
-from .fakes import D, FakeConfigProvider, FakeConnector, SteppingClock, make_log, ticker
+from .fakes import D, FakeConfigProvider, FakeConnector, ManualClock, SteppingClock, make_log, ticker
 
 BTC = "BTC/USDT:USDT"
 ETH = "ETH/USDT:USDT"
@@ -45,6 +45,7 @@ async def create_testnet(max_open_positions: int = 4, max_positions_per_exchange
     clock = SteppingClock(NOW, timedelta(milliseconds=60))
     stats = DefaultStatisticsCollector(config, clock)
     executor = ArbTradeExecutor(config, registry, stats, make_log(config, clock), clock)
+    executor._position_settle_delay = 0
     return executor, long_connector, short_connector, stats
 
 
@@ -169,8 +170,9 @@ async def test_market_close_without_confirmation_keeps_position_in_tracking():
     assert executor.has_open_positions
     assert stats.snapshot(NOW + timedelta(minutes=1)).closed_positions == []
 
-    # биржа подтвердила отсутствие позиции — закрытие довершается на следующем тике
+    # биржа подтвердила отсутствие позиции — закрытие довершается при следующей попытке (после паузы повтора)
     long_c.open_positions.clear()
+    executor._clock = ManualClock(executor._clock.now() + timedelta(seconds=2))
     await executor.manage_open_positions(tickers(long_c, short_c), NONE)
 
     assert not executor.has_open_positions
