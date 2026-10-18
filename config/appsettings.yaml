@@ -29,14 +29,14 @@ general:
 arbitrage:
   enabled: true                 # false — только мониторинг спредов
   allow_live: true              # страховка: Live + торговля требует явного true
-  min_spread_percent_up: 0.5    # порог входа (нетто, %)
-  min_spread_percent_down: 0.4  # порог фиксации прибыли (%)
-  stop_loss_spread_percent: 1   # стоп-лосс (%)
+  min_spread_percent_up: 0.4    # порог входа (нетто, %)
+  min_spread_percent_down: 0.3  # порог фиксации прибыли (%)
+  stop_loss_spread_percent: 3   # стоп-лосс (%)
   slippage_buffer_percent: 0.03
   max_spread_percent: 5.0       # спреды выше — аномалия, игнорируются
-  min_funding_rate_percent: -1.0
+  min_funding_rate_percent: -0.3
   include_fees: true
-  order_size_usd: 6             # номинал каждой ноги, USDT
+  order_size_usd: 12             # номинал каждой ноги, USDT
   order_execution_timeout_ms: 2000
   order_poll_interval_ms: 200
   rebalance_tolerance_percent: 1.0
@@ -50,11 +50,11 @@ arbitrage:
   #   chase: { mode: Simulated | Native, max_steps, step_interval_ms, step_bps,
   #            max_deviation_bps, fallback_to_market, params } — см. README.
   execution:
-    type: ChaseLimit
+    type: Market
     limit_offset_bps: 35
-    time_in_force: GTC
+    time_in_force: IOC
     close:
-      type: Limit
+      type: Market
 
   leverage: 5
   max_open_positions: 2

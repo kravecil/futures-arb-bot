@@ -15,7 +15,7 @@ exchanges:
 
     - id: bybit
       name: Bybit Linear
-      enabled: false
+      enabled: true
 
     - id: okx
       name: OKX Swap
@@ -23,7 +23,7 @@ exchanges:
 
     - id: gate
       name: Gate.io Futures
-      enabled: true
+      enabled: false
 
     - id: mexc
       name: MEXC Futures
