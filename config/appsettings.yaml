@@ -14,7 +14,7 @@ general:
     stale_after_ms: 3000        # поток молчит дольше — котировки биржи по REST (раз в refresh_interval_ms)
     volume_refresh_seconds: 60  # обновление оборотов за 24 ч и набора подписок по REST
     reconnect_after_ms: 5000    # поток молчит дольше — сбросить соединение и открыть заново (0 — не вмешиваться)
-    keep_alive_ms: 5000         # период ping-pong WebSocket ccxt (0 — как в ccxt, у OKX/Bybit 18 с)
+    keep_alive_ms: 15000        # период ping-pong WebSocket ccxt (0 — как в ccxt, у OKX/Bybit 18 с); при 5000 — десятки ложных обрывов (19.10)
     spread_report_seconds: 60   # раз в N с писать в журнал лучшие спреды за период (0 — не писать)
     spread_report_top: 5        # сколько лучших связок в этом отчёте
   orders:
@@ -67,3 +67,11 @@ arbitrage:
   confirm_order_book: true      # перед входом перепроверить спред по стаканам обеих бирж (REST)
   order_book_depth: 20          # уровней стакана для проверки
   order_book_timeout_ms: 1500   # стаканы не пришли за это время — сделка не открывается
+
+  # Защита выхода (разбор 19.10.2026: CT закрывался тейк-профитом через 0–8 с по скачку котировки и уходил в минус):
+  exit_confirm_scans: 2           # условие TP/SL должно продержаться столько сканов подряд (1 — закрывать сразу)
+  min_exit_profit_percent: 0.15   # TP только если расчётный PnL выхода не ниже этого (%, после комиссий)
+  exit_confirm_order_book: true   # перед TP перепроверить PnL выхода по стаканам обеих бирж (REST)
+  exit_max_quote_age_ms: 3000     # котировка ноги старше — TP откладывается (стоп-лосс не блокируется; 0 — не проверять)
+  reentry_cooldown_seconds: 300   # после закрытия не входить в тот же символ столько секунд
+  stop_loss_cooldown_seconds: 1800  # после стоп-лосса — столько секунд (0 — как reentry_cooldown_seconds)

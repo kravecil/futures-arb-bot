@@ -45,6 +45,12 @@ BOOK_REJECT_COOLDOWN = timedelta(seconds=10)
 POSITION_SETTLE_DELAY_SECONDS = 0.7
 """Пауза перед повторной сверкой позиции: биржа (Bybit) показывает позицию с задержкой после исполнения."""
 
+EXIT_BOOK_RECHECK = timedelta(seconds=2)
+"""Тейк-профит не подтвердился стаканом — столько не перепроверяем ту же позицию (не спамим REST и журналом)."""
+
+STALE_EXIT_NOTE_EVERY = timedelta(seconds=30)
+"""Как часто напоминать в журнале, что тейк-профит отложен из-за старых котировок."""
+
 CLOSE_RETRY_BASE = timedelta(seconds=1)
 """Пауза после первой неудачной попытки закрытия; дальше удваивается."""
 
@@ -179,6 +185,14 @@ class ArbTradeExecutor:
         self._close_attempts: dict[str, _CloseAttempts] = {}
         """Позиции, закрытие которых начато, но не завершено (символ → причина и повторы)."""
         self._position_settle_delay = POSITION_SETTLE_DELAY_SECONDS
+        self._exit_streaks: dict[str, tuple[CloseReason, int]] = {}
+        """Сколько сканов подряд держится условие выхода позиции (символ → причина, счётчик; exit_confirm_scans)."""
+        self._exit_book_rejected_until: dict[str, datetime] = {}
+        """Тейк-профит не подтвердился стаканом — до этого момента стакан по символу не перепроверяется."""
+        self._stale_exit_noted_at: dict[str, datetime] = {}
+        """Когда в журнал последний раз писали, что тейк-профит отложен из-за старых котировок."""
+        self._reentry_blocked_until: dict[str, datetime] = {}
+        """Символ → момент, до которого новая позиция по нему не открывается (пауза после закрытия)."""
 
     @property
     def has_open_positions(self) -> bool:
@@ -216,6 +230,12 @@ class ArbTradeExecutor:
                 if candidate.symbol in self._positions:
                     continue  # на символ — одна арбитражная позиция
 
+                blocked_until = self._reentry_blocked_until.get(candidate.symbol)
+                if blocked_until is not None:
+                    if self._clock.now() < blocked_until:
+                        continue  # пауза после недавнего закрытия по этому символу (reentry/stop_loss_cooldown)
+                    self._reentry_blocked_until.pop(candidate.symbol, None)
+
                 if len(self._positions) + external_arbitrages >= options.max_open_positions:
                     return  # лимит сеансовых и найденных на биржах арбитражей исчерпан
 
@@ -240,6 +260,8 @@ class ArbTradeExecutor:
         mode = self._config.current.general.network_mode
         now = self._clock.now()
         to_close: list[tuple[PositionPair, CloseReason]] = []
+        to_decide: list[tuple[PositionPair, CloseReason, Decimal, Decimal]] = []
+        """Новые решения о выходе: позиция, причина, брутто и расчётный PnL выхода по котировкам."""
         to_rebalance: list[PositionPair] = []
 
         for position in list(self._positions.values()):
@@ -258,25 +280,28 @@ class ArbTradeExecutor:
 
             current_gross = (short_ticker.bid - long_ticker.ask) / long_ticker.ask * HUNDRED
             # «текущий спред» меряется сторонами входа и потому оптимистичен на ширину обоих стаканов:
-            # тейк-профит разрешаем только при положительном PnL немедленного выхода
+            # тейк-профит разрешаем только при PnL немедленного выхода выше нуля и не ниже min_exit_profit_percent
             net_now = self._net_profit_percent(position, long_ticker, short_ticker)
-            reason: CloseReason | None
-            if current_gross <= options.min_spread_percent_down and net_now > ZERO:
-                reason = CloseReason.TAKE_PROFIT
+            signal: CloseReason | None
+            if current_gross <= options.min_spread_percent_down and net_now > ZERO and net_now >= options.min_exit_profit_percent:
+                signal = CloseReason.TAKE_PROFIT
             elif current_gross >= options.stop_loss_spread_percent:
-                reason = CloseReason.STOP_LOSS
-            elif now - position.opened_at >= timedelta(minutes=options.max_position_age_minutes):
-                reason = CloseReason.TIMEOUT
+                signal = CloseReason.STOP_LOSS
             else:
-                reason = None
+                signal = None
+
+            # тейк-профит по старой котировке (поток одной из бирж молчит/переподключается) не берём:
+            # «прибыль» там часто фантомная. Стоп-лосс аварийный — его возраст котировок не блокирует
+            if signal == CloseReason.TAKE_PROFIT and self._quotes_too_old(position, long_ticker, short_ticker, options, now):
+                signal = None
+
+            # подтверждение сканами: разовый скачок котировки позицию не закрывает
+            reason = self._confirm_exit_signal(position.symbol, signal, options)
+            if reason is None and now - position.opened_at >= timedelta(minutes=options.max_position_age_minutes):
+                reason = CloseReason.TIMEOUT
 
             if reason is not None:
-                held_minutes = int((now - position.opened_at).total_seconds() // 60)
-                self._log.info(
-                    f"Закрываю арбитраж {position.symbol} ({_describe_reason(reason)}): брутто сейчас {formatting.pct(current_gross)}, "
-                    f"расчётный PnL выхода {formatting.pct(net_now)}, позиция открыта {held_minutes} мин"
-                )
-                to_close.append((position, reason))
+                to_decide.append((position, reason, current_gross, net_now))
                 continue
 
             # закрытие ног не завершено — сначала добьём закрытие, не ребалансируя наполовину голые ноги
@@ -286,11 +311,28 @@ class ArbTradeExecutor:
             if mode != NetworkMode.DRY_RUN and abs(position.imbalance) > self._rebalance_tolerance(position, options):
                 to_rebalance.append(position)
 
-        if not to_close and not to_rebalance:
+        if not to_close and not to_decide and not to_rebalance:
             return
 
         await self._acquire(ct)
         try:
+            for position, reason, current_gross, net_now in to_decide:
+                if reason == CloseReason.TAKE_PROFIT and options.exit_confirm_order_book:
+                    # котировки обещают прибыль — проверяем, даст ли её реальный стакан под объём ног
+                    book_net = await self._confirm_exit_with_order_books(position, net_now, options, ct)
+                    if book_net is None:
+                        continue
+                    net_now = book_net
+
+                held_minutes = int((now - position.opened_at).total_seconds() // 60)
+                held_seconds = int((now - position.opened_at).total_seconds())
+                held = f"{held_minutes} мин" if held_minutes > 0 else f"{held_seconds} с"
+                self._log.info(
+                    f"Закрываю арбитраж {position.symbol} ({_describe_reason(reason)}): брутто сейчас {formatting.pct(current_gross)}, "
+                    f"расчётный PnL выхода {formatting.pct(net_now)}, позиция открыта {held}"
+                )
+                to_close.append((position, reason))
+
             closing_symbols = {p.symbol for p, _ in to_close}
 
             for position, reason in to_close:
@@ -1024,15 +1066,121 @@ class ArbTradeExecutor:
         Расчётный PnL пары (в % оборота) при закрытии прямо сейчас: валовый спред входа минус
         стоимость немедленного выхода (лонг — по его bid, шорт — по его ask) и taker-комиссии полного круга.
         """
-        if position.entry_long <= ZERO or long_ticker.bid <= ZERO:
+        return self._net_exit_percent(position, long_ticker.bid, short_ticker.ask)
+
+    def _net_exit_percent(self, position: PositionPair, long_exit: Decimal, short_exit: Decimal) -> Decimal:
+        """Расчётный PnL пары (в % оборота) при выходе продажей лонга по long_exit и откупом шорта по short_exit."""
+        if position.entry_long <= ZERO or long_exit <= ZERO:
             return ZERO
 
         entry_gross = (position.entry_short - position.entry_long) / position.entry_long * HUNDRED
-        unwind_cost = (short_ticker.ask - long_ticker.bid) / long_ticker.bid * HUNDRED
+        unwind_cost = (short_exit - long_exit) / long_exit * HUNDRED
         round_trip_fees = 2 * (
             self._taker_percent_of(position.long_exchange_id, position.symbol) + self._taker_percent_of(position.short_exchange_id, position.symbol)
         )
         return entry_gross - unwind_cost - round_trip_fees
+
+    # ------------------------- защита выхода -------------------------
+
+    def _confirm_exit_signal(self, symbol: str, signal: CloseReason | None, options: ArbitrageOptions) -> CloseReason | None:
+        """
+        Условие выхода должно продержаться exit_confirm_scans сканов подряд с той же причиной:
+        одиночный скачок котировки тонкого символа позицию не закрывает. None — выходить рано.
+        """
+        if signal is None:
+            self._exit_streaks.pop(symbol, None)
+            return None
+
+        previous = self._exit_streaks.get(symbol)
+        count = previous[1] + 1 if previous is not None and previous[0] == signal else 1
+        self._exit_streaks[symbol] = (signal, count)
+        return signal if count >= max(1, options.exit_confirm_scans) else None
+
+    def _quotes_too_old(
+        self, position: PositionPair, long_ticker: TickerSnapshot, short_ticker: TickerSnapshot, options: ArbitrageOptions, now: datetime
+    ) -> bool:
+        """Котировка какой-то ноги старше exit_max_quote_age_ms — решение о тейк-профите откладывается."""
+        limit_ms = options.exit_max_quote_age_ms
+        if limit_ms <= 0:
+            return False
+
+        ages = [_ticker_age_ms(t, now) for t in (long_ticker, short_ticker)]
+        if all(age is None or age <= limit_ms for age in ages):
+            self._stale_exit_noted_at.pop(position.symbol, None)
+            return False
+
+        noted = self._stale_exit_noted_at.get(position.symbol)
+        if noted is None or now - noted >= STALE_EXIT_NOTE_EVERY:
+            self._stale_exit_noted_at[position.symbol] = now
+            text = "/".join("н/д" if a is None else f"{a:.0f}" for a in ages)
+            self._log.info(f"{position.symbol}: тейк-профит отложен — котировки старше {limit_ms} мс (лонг/шорт {text} мс), жду свежих")
+        return True
+
+    async def _confirm_exit_with_order_books(
+        self, position: PositionPair, quoted_net: Decimal, options: ArbitrageOptions, ct: CancellationToken
+    ) -> Decimal | None:
+        """
+        Перепроверка тейк-профита по свежим стаканам обеих бирж (REST): по каким ценам реально
+        продастся лонг и откупится шорт фактического объёма. PnL выхода ниже порога — None (не закрываем).
+        """
+        symbol = position.symbol
+        now = self._clock.now()
+        until = self._exit_book_rejected_until.get(symbol)
+        if until is not None and now < until:
+            return None
+
+        def reject(reason: str) -> None:
+            self._exit_book_rejected_until[symbol] = now + EXIT_BOOK_RECHECK
+            self._exit_streaks.pop(symbol, None)  # подтверждение сканами начнётся заново
+            self._log.info(f"{symbol}: {reason} — позиция остаётся открытой")
+
+        long_connector = self._registry.find(position.long_exchange_id)
+        short_connector = self._registry.find(position.short_exchange_id)
+        if long_connector is None or short_connector is None:
+            return None
+
+        depth = max(1, options.order_book_depth)
+        try:
+            long_book, short_book = await asyncio.wait_for(
+                asyncio.gather(
+                    long_connector.fetch_order_book(symbol, depth, ct),
+                    short_connector.fetch_order_book(symbol, depth, ct),
+                ),
+                timeout=options.order_book_timeout_ms / 1000,
+            )
+        except TimeoutError:
+            reject(f"тейк-профит не проверен: стаканы не получены за {options.order_book_timeout_ms} мс")
+            return None
+
+        if long_book is None or short_book is None:
+            missing = long_connector.display_name if long_book is None else short_connector.display_name
+            reject(f"тейк-профит не проверен: стакан {missing} недоступен")
+            return None
+
+        sell_long = _sweep(long_book, OrderSide.SELL, position.long_size)
+        buy_short = _sweep(short_book, OrderSide.BUY, position.short_size)
+        if sell_long is None or buy_short is None:
+            thin = long_connector.display_name if sell_long is None else short_connector.display_name
+            reject(f"тейк-профит не подтвердился: в стакане {thin} не хватает глубины на объём позиции")
+            return None
+
+        net = self._net_exit_percent(position, sell_long, buy_short)
+        required = max(options.min_exit_profit_percent, ZERO)
+        if net <= ZERO or net < required:
+            reject(
+                f"тейк-профит не подтвердился стаканом: по котировкам PnL выхода {formatting.pct(quoted_net)}, "
+                f"по стакану {formatting.pct(net)} (продать {long_connector.id} @ {formatting.price(sell_long)}, "
+                f"откупить {short_connector.id} @ {formatting.price(buy_short)})"
+            )
+            return None
+
+        self._exit_book_rejected_until.pop(symbol, None)
+        return net
+
+    def _forget_exit_state(self, symbol: str) -> None:
+        self._exit_streaks.pop(symbol, None)
+        self._exit_book_rejected_until.pop(symbol, None)
+        self._stale_exit_noted_at.pop(symbol, None)
 
     # ------------------------- закрытие -------------------------
 
@@ -1236,6 +1384,15 @@ class ArbTradeExecutor:
 
         self._positions.pop(position.symbol, None)
         self._close_attempts.pop(position.symbol, None)
+        self._forget_exit_state(position.symbol)
+
+        # пауза перед повторным входом: сразу после выхода спред по символу обычно ещё «дёргается»
+        cooldown = options.reentry_cooldown_seconds
+        if reason == CloseReason.STOP_LOSS and options.stop_loss_cooldown_seconds > 0:
+            cooldown = options.stop_loss_cooldown_seconds
+        if cooldown > 0:
+            self._reentry_blocked_until[position.symbol] = position.closed_at + timedelta(seconds=cooldown)
+
         self._stats.record_closed(position)
         self._log.success(f"Закрыт арбитраж {position.symbol} ({_describe_reason(reason)}): PnL {formatting.usd(position.realized_pnl_usd)}")
 
@@ -1371,6 +1528,11 @@ class ArbTradeExecutor:
 
 def _streak_key(estimate: SpreadEstimate) -> _StreakKey:
     return estimate.symbol, estimate.long_leg.exchange_id, estimate.short_leg.exchange_id
+
+
+def _ticker_age_ms(ticker: TickerSnapshot, now: datetime) -> float | None:
+    """Возраст котировки, мс (None — биржа не дала время)."""
+    return max(0.0, (now - ticker.timestamp).total_seconds() * 1000) if ticker.timestamp is not None else None
 
 
 def _sweep(book: OrderBookSnapshot, side: OrderSide, amount: Decimal) -> Decimal | None:
