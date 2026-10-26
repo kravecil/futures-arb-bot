@@ -76,6 +76,17 @@ class ChaseMode(_CaseInsensitiveEnum):
     """Нативный chase-ордер биржи."""
 
 
+class MakerLeg(_CaseInsensitiveEnum):
+    """Какая нога входа ставится лимиткой-мейкером при схеме «maker + хедж»."""
+
+    AUTO = "Auto"
+    """Та, чья расчётная цена ближе к своему краю стакана (вероятнее исполнится)."""
+    LONG = "Long"
+    """Покупка на дешёвой бирже; хедж — продажа на дорогой."""
+    SHORT = "Short"
+    """Продажа на дорогой бирже; хедж — покупка на дешёвой."""
+
+
 class PositionStatus(_CaseInsensitiveEnum):
     OPEN = "Open"
     CLOSED = "Closed"

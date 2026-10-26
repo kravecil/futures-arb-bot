@@ -319,6 +319,7 @@ class FakeExecutor:
 
     def __init__(self) -> None:
         self.processed_batches: list[list[SpreadEstimate]] = []
+        self.maker_batches: list[list[SpreadEstimate]] = []
 
     @property
     def processed(self) -> list[SpreadEstimate]:
@@ -333,6 +334,18 @@ class FakeExecutor:
             self.processed_batches.append(list(candidates))
 
     async def manage_open_positions(self, tickers_by_exchange: Mapping[str, Mapping[str, TickerSnapshot]], ct: CancellationToken) -> None:
+        return None
+
+    @property
+    def has_pending_entries(self) -> bool:
+        return False
+
+    async def process_maker_quotes(
+        self, candidates: Sequence[SpreadEstimate], tickers_by_exchange: Mapping[str, Mapping[str, TickerSnapshot]], ct: CancellationToken
+    ) -> None:
+        self.maker_batches.append(list(candidates))
+
+    async def cancel_pending_entries(self, ct: CancellationToken) -> None:
         return None
 
     async def close_all(self, reason: CloseReason, ct: CancellationToken) -> None:

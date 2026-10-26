@@ -11,7 +11,7 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from futures_arb_bot.core.domain.enums import ChaseMode, MarketDataSource, MaxSendEndpoint, NetworkMode, OrderType, TimeInForce
+from futures_arb_bot.core.domain.enums import ChaseMode, MakerLeg, MarketDataSource, MaxSendEndpoint, NetworkMode, OrderType, TimeInForce
 
 
 def normalize_key(key: str) -> str:
@@ -146,6 +146,44 @@ class OrderExecutionOptions(ConfigModel):
     close: OrderExecutionOptions | None = None
 
 
+class MakerHedgeOptions(ConfigModel):
+    """
+    Вход «maker + хедж» (arbitrage.maker_hedge): лимитка post-only заранее стоит на одной бирже по цене,
+    при которой спред с хеджем даёт целевое нетто; как только она исполнилась — сразу IOC/market
+    на второй бирже на исполненный объём. Выключено — прежний вход двумя taker-ногами.
+    """
+
+    enabled: bool = False
+    trigger_gross_percent: Decimal = Decimal("0.3")
+    """Начинать котировать, когда брутто-спред по лучшим ценам (bid дорогой − ask дешёвой) не ниже этого, %."""
+    target_net_percent: Decimal | None = None
+    """Нетто сделки, ради которого считается цена заявки (после maker+taker входа и taker выхода), %; None — min_spread_percent_up."""
+    cancel_after_ms: int = 2_000
+    """Сигнал (брутто ≥ trigger) пропал и не вернулся за это время — заявка снимается, мс."""
+    requote_threshold_bps: Decimal = Decimal(5)
+    """Расчётная цена ушла от выставленной дальше этого — заявка переставляется, bps."""
+    min_requote_interval_ms: int = 300
+    """Не переставлять заявку чаще этого (лимиты запросов бирж), мс."""
+    max_quotes: int = 2
+    """Сколько заявок-мейкеров может висеть одновременно (каждая занимает слот позиции)."""
+    maker_leg: MakerLeg = MakerLeg.AUTO
+    maker_exchanges: list[str] = Field(default_factory=list)
+    """На каких биржах можно ставить мейкер-ногу (id из exchanges.yaml); пусто — на любой с post-only."""
+    hedge_offset_bps: Decimal = Decimal(30)
+    """Хедж — IOC-лимитка по котировке со смещением в сторону агрессии, bps (страховка от ухода цены)."""
+    hedge_fallback_to_market: bool = True
+    """IOC-хедж исполнился не полностью — добить остаток market; false — откатить мейкер-ногу."""
+
+    @field_validator("maker_exchanges", mode="before")
+    @classmethod
+    def _list_or_empty(cls, value: Any) -> Any:
+        if value is None:
+            return []
+        if isinstance(value, str):
+            return [value]
+        return [str(v) for v in value if v is not None] if isinstance(value, list) else value
+
+
 class ArbitrageOptions(ConfigModel):
     """Настройки арбитража (appsettings.yaml → arbitrage)."""
 
@@ -190,6 +228,8 @@ class ArbitrageOptions(ConfigModel):
     """После закрытия позиции столько секунд не открывать новую по тому же символу (0 — сразу)."""
     stop_loss_cooldown_seconds: int = 0
     """После стоп-лосса столько секунд не открывать позицию по тому же символу (0 — как reentry_cooldown_seconds)."""
+    maker_hedge: MakerHedgeOptions = Field(default_factory=MakerHedgeOptions)
+    """Вход «maker на одной ноге + мгновенный хедж второй» (по умолчанию выключен)."""
 
 
 class SymbolsOptions(ConfigModel):

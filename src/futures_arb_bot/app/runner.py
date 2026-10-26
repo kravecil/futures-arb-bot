@@ -234,6 +234,10 @@ class AppRunner:
         options = self._config.current
         executor = self._services.executor
 
+        # висящие заявки-мейкеры («maker + хедж») снимаются всегда: иначе они исполнятся без хеджа
+        if executor.has_pending_entries:
+            await executor.cancel_pending_entries(_NONE)
+
         if executor.has_open_positions:
             if options.arbitrage.enabled and options.arbitrage.close_positions_on_exit:
                 await executor.close_all(CloseReason.SESSION_END, _NONE)

@@ -24,7 +24,7 @@ from futures_arb_bot.core.abstractions import (
 )
 from futures_arb_bot.core.cancellation import CancellationToken, OperationCanceledError, delay
 from futures_arb_bot.core.clock import Clock
-from futures_arb_bot.core.domain.arbitrage import SpreadEstimate
+from futures_arb_bot.core.domain.arbitrage import OpportunityLeg, SpreadEstimate
 from futures_arb_bot.core.domain.enums import MarketDataSource
 from futures_arb_bot.core.domain.market_data import ExchangeFees, FetchTickersResult, TickerSnapshot
 from futures_arb_bot.core.domain.options import BotOptions
@@ -76,6 +76,8 @@ class DefaultArbitrageScanner:
         self._prepared = False
         self._spread_report = SpreadReporter(log, clock)
         self._compared_pairs = 0
+        self._maker_candidates: list[SpreadEstimate] = []
+        """Связки для входа «maker + хедж»: брутто по лучшим ценам ≥ maker_hedge.trigger_gross_percent."""
 
     @property
     def snapshot(self) -> DashboardSnapshot | None:
@@ -164,9 +166,20 @@ class DefaultArbitrageScanner:
             # и с пустым списком: исполнитель так узнаёт, что связка пропала, и сбрасывает счётчик подтверждений
             await self._executor.process_opportunities(candidates, ct)
 
+        by_exchange = {connector.id: result.tickers for connector, result in fetched}
         if options.arbitrage.enabled or self._executor.has_open_positions:
-            by_exchange = {connector.id: result.tickers for connector, result in fetched}
             await self._executor.manage_open_positions(by_exchange, ct)
+
+        maker_on = options.arbitrage.enabled and options.arbitrage.maker_hedge.enabled
+        if maker_on or self._executor.has_pending_entries:
+            # и с пустым списком: исполнитель снимает заявки, сигнал которых пропал (или вход выключен)
+            maker_candidates: list[SpreadEstimate] = []
+            if maker_on:
+                for candidate in self._maker_candidates:
+                    net_funding = _net_funding_percent(candidate)
+                    if net_funding is None or net_funding >= limit:
+                        maker_candidates.append(candidate)
+            await self._executor.process_maker_quotes(maker_candidates, by_exchange, ct)
 
     def _update_subscriptions(self, options: BotOptions) -> None:
         """
@@ -306,7 +319,9 @@ class DefaultArbitrageScanner:
 
         estimates: list[SpreadEstimate] = []
         self._compared_pairs = 0
+        self._maker_candidates = []
         arbitrage = options.arbitrage
+        maker_trigger = arbitrage.maker_hedge.trigger_gross_percent if arbitrage.maker_hedge.enabled else None
         for symbol, quotes, _ in cross_exchange:
             cheaper: TickerSnapshot | None = None
             richer: TickerSnapshot | None = None
@@ -342,6 +357,33 @@ class DefaultArbitrageScanner:
                     anomaly=gross > arbitrage.max_spread_percent,
                 )
 
+            if maker_trigger is not None and cheaper.ask > 0 and cheaper.is_tradable and richer.is_tradable:
+                maker_gross = (richer.bid - cheaper.ask) / cheaper.ask * 100
+                if maker_trigger <= maker_gross <= arbitrage.max_spread_percent:
+                    self._maker_candidates.append(
+                        SpreadEstimate(
+                            symbol,
+                            OpportunityLeg(
+                                cheaper.exchange_id,
+                                cheaper.ask,
+                                self._fees_of(cheaper.exchange_id, symbol).taker_percent,
+                                _funding_of(funding, cheaper.exchange_id, symbol),
+                                cheaper.timestamp,
+                            ),
+                            OpportunityLeg(
+                                richer.exchange_id,
+                                richer.bid,
+                                self._fees_of(richer.exchange_id, symbol).taker_percent,
+                                _funding_of(funding, richer.exchange_id, symbol),
+                                richer.timestamp,
+                            ),
+                            maker_gross.quantize(Decimal("0.0001")),
+                            Decimal(0),
+                            min(cheaper.quote_volume_24h, richer.quote_volume_24h),
+                            now,
+                        )
+                    )
+
             estimate = self._calculator.calculate(
                 cheaper, richer, self._fees_of(cheaper.exchange_id, symbol), self._fees_of(richer.exchange_id, symbol)
             )
@@ -366,6 +408,7 @@ class DefaultArbitrageScanner:
             estimates.append(estimate)
 
         estimates.sort(key=lambda e: e.net_percent, reverse=True)
+        self._maker_candidates.sort(key=lambda e: e.gross_percent, reverse=True)
         return estimates, tracked_symbols
 
     def _fees_of(self, exchange_id: str, symbol: str) -> ExchangeFees:

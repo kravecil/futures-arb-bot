@@ -163,6 +163,20 @@ class TradeExecutor(Protocol):
 
     async def manage_open_positions(self, tickers_by_exchange: Mapping[str, Mapping[str, TickerSnapshot]], ct: CancellationToken) -> None: ...
 
+    @property
+    def has_pending_entries(self) -> bool:
+        """Висят заявки-мейкеры входа «maker + хедж»."""
+        ...
+
+    async def process_maker_quotes(
+        self,
+        candidates: Sequence[SpreadEstimate],
+        tickers_by_exchange: Mapping[str, Mapping[str, TickerSnapshot]],
+        ct: CancellationToken,
+    ) -> None: ...
+
+    async def cancel_pending_entries(self, ct: CancellationToken) -> None: ...
+
     async def close_all(self, reason: CloseReason, ct: CancellationToken) -> None: ...
 
 
