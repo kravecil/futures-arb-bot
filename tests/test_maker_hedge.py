@@ -397,3 +397,105 @@ async def test_scanner_skips_maker_signals_when_disabled():
     h = await create()
     await h.scanner.scan_once(NONE)
     assert h.executor.maker_batches == []
+
+
+# ------------------------- защита от исполнения «против нас» (разбор 27.10.2026) -------------------------
+
+
+async def test_paying_funding_is_priced_into_maker_quote():
+    h = Harness()
+    executor = await h.start()
+    base = h.signal()
+    signal = SpreadEstimate(
+        BTC,
+        OpportunityLeg("okx", base.long_leg.price, D("0.05"), funding_percent=D(0)),
+        OpportunityLeg("bybit", base.short_leg.price, D("0.05"), funding_percent=D("-0.2")),
+        base.gross_percent,
+        D(0),
+        D(0),
+        h.clock.now(),
+    )
+
+    await executor.process_maker_quotes([signal], {"okx": h.cheap.tickers, "bybit": h.rich.tickers}, NONE)
+
+    ((_, order),) = h.maker_orders()
+    # нужно брутто 0.4 + 0.2 (фандинг) + 0.17 (комиссии) + 0.03 (буфер) = 0.8 % от ask дешёвой
+    assert order.price == D("100.8")
+
+
+async def test_quote_withdrawn_and_paused_when_market_jumps():
+    h = Harness()
+    executor = await h.start()
+    await h.tick()
+    ((order_id, _),) = h.maker_orders()
+
+    h.clock.advance(timedelta(milliseconds=200))
+    h.set_quotes(cheap_ask=D("100.5"), rich_bid=D("100.7"))  # +50 bps за 200 мс > max_volatility_bps = 30
+    await h.tick()
+
+    assert not executor.has_pending_entries
+    assert order_id in h.rich.cancelled_orders
+    assert h.cheap.placed_orders == {}
+
+    h.clock.advance(timedelta(seconds=2))
+    await h.tick()
+    assert len(h.maker_orders()) == 1  # пауза volatility_cooldown_ms — новая заявка не ставится
+
+    h.clock.advance(timedelta(seconds=4))  # окно 3 с ушло, цена стоит — можно снова
+    h.set_quotes(cheap_ask=D("100.5"), rich_bid=D("100.7"))
+    await h.tick()
+    assert len(h.maker_orders()) == 2
+
+
+async def test_volatility_check_can_be_disabled():
+    h = Harness()
+    h.config.current.arbitrage.maker_hedge.max_volatility_bps = D(0)
+    executor = await h.start()
+    await h.tick()
+
+    h.clock.advance(timedelta(milliseconds=400))
+    h.set_quotes(cheap_ask=D("100.5"), rich_bid=D("100.7"))
+    await h.tick()
+
+    assert executor.has_pending_entries  # перестановка за ценой, а не снятие
+
+
+async def test_adverse_hedge_move_requotes_without_waiting_min_interval():
+    h = Harness()
+    await h.start()
+    await h.tick()
+
+    h.clock.advance(timedelta(milliseconds=100))  # < min_requote_interval_ms = 300
+    h.set_quotes(cheap_ask=D("100.1"), rich_bid=D("100.2"))  # хедж (покупка на okx) подорожал на 10 bps
+    await h.tick()
+
+    orders = h.maker_orders()
+    assert len(orders) == 2
+    assert orders[-1][1].price == D("100.7006")  # 100.1 × 1.006
+
+
+async def test_favourable_hedge_move_still_respects_min_interval():
+    h = Harness()
+    await h.start()
+    await h.tick()
+
+    h.clock.advance(timedelta(milliseconds=100))
+    h.set_quotes(cheap_ask=D("99.9"), rich_bid=D("100.2"))  # хедж подешевел — спешить незачем
+    await h.tick()
+
+    assert len(h.maker_orders()) == 1
+
+
+async def test_dry_run_warns_when_hedge_fills_worse_than_planned():
+    h = Harness(NetworkMode.DRY_RUN)
+    executor = await h.start()
+    await h.tick()
+
+    h.clock.advance(timedelta(milliseconds=200))
+    h.set_quotes(cheap_ask=D("100.2"), rich_bid=D("100.6"))  # мейкер исполнен, но хедж уже на 20 bps дороже
+    await h.tick()
+
+    position = executor._positions[BTC]
+    assert position.entry_long == D("100.2")
+    warnings = [e.message for e in h.log.latest(20) if "хуже расчёта" in e.message]
+    assert len(warnings) == 1 and "20" in warnings[0]

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import math
+from collections import deque
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
@@ -16,7 +17,7 @@ from decimal import ROUND_CEILING, ROUND_FLOOR, ROUND_HALF_EVEN, Decimal
 from futures_arb_bot.core.abstractions import ConfigProvider, EventLog, ExchangeConnector, StatisticsCollector
 from futures_arb_bot.core.cancellation import CancellationToken, OperationCanceledError
 from futures_arb_bot.core.clock import Clock
-from futures_arb_bot.core.domain.arbitrage import OpportunityLeg, PositionPair, SpreadEstimate
+from futures_arb_bot.core.domain.arbitrage import OpportunityLeg, PositionPair, SpreadEstimate, funding_cost_percent
 from futures_arb_bot.core.domain.enums import CloseReason, NetworkMode, OrderSide, OrderType, PositionStatus, TimeInForce
 from futures_arb_bot.core.domain.market_data import ExchangeFees, MarketInfo, OrderBookSnapshot, OrderRequest, TickerSnapshot
 from futures_arb_bot.core.domain.options import ArbitrageOptions
@@ -69,6 +70,9 @@ MAKER_HEDGE_FAIL_COOLDOWN = timedelta(seconds=60)
 
 MAKER_WITHDRAW_COOLDOWN = timedelta(seconds=1)
 """После снятия заявки-мейкера столько не ставим новую по тому же символу (не дёргаем стакан)."""
+
+VOLATILITY_NOTE_EVERY = timedelta(seconds=60)
+"""Как часто писать в журнал, что заявка-мейкер по символу не ставится из-за волатильности."""
 
 _FOUR_PLACES = Decimal("0.0001")
 
@@ -179,6 +183,8 @@ class _MakerQuote:
     signal_at: datetime
     """Когда сигнал (брутто ≥ trigger по этой связке) последний раз был на месте."""
     requotes: int = 0
+    funding_cost: Decimal = ZERO
+    """Плата за фандинг (funding_periods_in_net выплат), заложенная в цену заявки сверх целевого нетто, %."""
 
     @property
     def simulated(self) -> bool:
@@ -229,6 +235,9 @@ class ArbTradeExecutor:
         """Висящие заявки-мейкеры входа «maker + хедж» (символ → заявка)."""
         self._maker_blocked_until: dict[str, datetime] = {}
         """Символ → момент, до которого новая заявка-мейкер по нему не ставится."""
+        self._mid_history: dict[tuple[str, str], deque[tuple[datetime, Decimal]]] = {}
+        """(биржа, символ) → недавние средние цены для проверки волатильности перед заявкой-мейкером."""
+        self._volatility_noted_at: dict[str, datetime] = {}
         self._leverage_applied: set[tuple[str, str, int]] = set()
         """(биржа, символ, плечо), уже выставленные для заявок-мейкеров: не повторяем запрос на каждой заявке."""
 
@@ -890,6 +899,7 @@ class ArbTradeExecutor:
         active = options.enabled and options.maker_hedge.enabled
         if not active and not self._maker_quotes:
             return
+        self._record_mids(tickers_by_exchange, {c.symbol for c in candidates} | set(self._maker_quotes), options)
 
         await self._acquire(ct)
         try:
@@ -940,10 +950,61 @@ class ArbTradeExecutor:
         if len(self._positions) + len(self._maker_quotes) + self._count_external_arbitrages() >= options.max_open_positions:
             return False
         per_exchange = self._count_per_exchange()
-        return (
-            per_exchange.get(candidate.long_leg.exchange_id, 0) < options.max_positions_per_exchange
-            and per_exchange.get(candidate.short_leg.exchange_id, 0) < options.max_positions_per_exchange
-        )
+        if (
+            per_exchange.get(candidate.long_leg.exchange_id, 0) >= options.max_positions_per_exchange
+            or per_exchange.get(candidate.short_leg.exchange_id, 0) >= options.max_positions_per_exchange
+        ):
+            return False
+        mh = options.maker_hedge
+        swing = self._volatility_bps(symbol, (candidate.long_leg.exchange_id, candidate.short_leg.exchange_id), options)
+        if swing is not None:
+            noted = self._volatility_noted_at.get(symbol)
+            if noted is None or now - noted >= VOLATILITY_NOTE_EVERY:
+                self._volatility_noted_at[symbol] = now
+                self._log.info(
+                    f"{symbol}: заявку-мейкер не ставлю — размах цены {dec_str(swing.quantize(Decimal('0.1')))} bps "
+                    f"за {mh.volatility_window_ms} мс (предел {dec_str(mh.max_volatility_bps)} bps)"
+                )
+            return False
+        return True
+
+    def _record_mids(self, tickers_by_exchange: Mapping[str, Mapping[str, TickerSnapshot]], symbols: set[str], options: ArbitrageOptions) -> None:
+        """Запоминает средние цены символов-кандидатов и висящих заявок на всех биржах (окно volatility_window_ms)."""
+        mh = options.maker_hedge
+        if mh.max_volatility_bps <= ZERO or mh.volatility_window_ms <= 0:
+            self._mid_history.clear()
+            return
+        now = self._clock.now()
+        horizon = now - timedelta(milliseconds=mh.volatility_window_ms)
+        for exchange_id, tickers in tickers_by_exchange.items():
+            for symbol in symbols:
+                t = tickers.get(symbol)
+                if t is None or not t.is_tradable:
+                    continue
+                history = self._mid_history.setdefault((exchange_id, symbol), deque())
+                history.append((now, (t.bid + t.ask) / 2))
+        for key in list(self._mid_history):
+            history = self._mid_history[key]
+            while history and history[0][0] < horizon:
+                history.popleft()
+            if not history:
+                del self._mid_history[key]
+
+    def _volatility_bps(self, symbol: str, exchange_ids: Sequence[str], options: ArbitrageOptions) -> Decimal | None:
+        """Наибольший размах mid по биржам связки за окно, bps, если он выше max_volatility_bps; иначе None."""
+        limit = options.maker_hedge.max_volatility_bps
+        if limit <= ZERO:
+            return None
+        worst = ZERO
+        for exchange_id in exchange_ids:
+            history = self._mid_history.get((exchange_id, symbol))
+            if not history:
+                continue
+            low = min(m for _, m in history)
+            high = max(m for _, m in history)
+            if low > ZERO:
+                worst = max(worst, (high - low) / low * _TEN_THOUSAND)
+        return worst if worst > limit else None
 
     def _maker_allowed(self, options: ArbitrageOptions, connectors: Sequence[ExchangeConnector]) -> set[str]:
         """Биржи, где можно стоять мейкером: из maker_exchanges (пусто — все) и только с post-only."""
@@ -974,12 +1035,13 @@ class ArbTradeExecutor:
         if long_connector is None or short_connector is None or cheap is None or rich is None:
             return
 
+        funding_cost = funding_cost_percent(candidate, options.funding_periods_in_net)
         plan = plan_quote(
             cheap,
             rich,
             _fees_of(long_connector, candidate.symbol),
             _fees_of(short_connector, candidate.symbol),
-            target_net=self._maker_target(options),
+            target_net=self._maker_target(options) + funding_cost,
             buffer=options.slippage_buffer_percent,
             include_fees=options.include_fees,
             leg=options.maker_hedge.maker_leg,
@@ -998,10 +1060,13 @@ class ArbTradeExecutor:
             f"на {maker.display_name} (+{dec_str(plan.distance_bps.quantize(Decimal('0.1')))} bps от края стакана), "
             f"хедж {plan.hedge_side} на {hedge.display_name} от {formatting.price(plan.hedge_reference)}, "
             f"расчётное нетто {formatting.pct(plan.expected_net_percent)} (брутто сейчас {formatting.pct(candidate.gross_percent)})"
+            + (f", в т. ч. на фандинг {formatting.pct(funding_cost)}" if funding_cost > ZERO else "")
         )
 
         if self._config.current.general.network_mode == NetworkMode.DRY_RUN:
-            self._maker_quotes[candidate.symbol] = _MakerQuote(candidate.symbol, plan, maker, hedge, amount, None, now, now, now)
+            self._maker_quotes[candidate.symbol] = _MakerQuote(
+                candidate.symbol, plan, maker, hedge, amount, None, now, now, now, funding_cost=funding_cost
+            )
             self._log.info(f"[СИМУЛЯЦИЯ] {description}")
             return
 
@@ -1016,7 +1081,7 @@ class ArbTradeExecutor:
             self._maker_blocked_until[candidate.symbol] = now + MAKER_REJECT_COOLDOWN
             return
 
-        quote = _MakerQuote(candidate.symbol, plan, maker, hedge, amount, leg, now, now, now)
+        quote = _MakerQuote(candidate.symbol, plan, maker, hedge, amount, leg, now, now, now, funding_cost=funding_cost)
         self._maker_quotes[candidate.symbol] = quote
         self._log.info(description)
         if leg.filled > ZERO:
@@ -1035,6 +1100,7 @@ class ArbTradeExecutor:
         long_id, short_id = (quote.hedge.id, quote.maker.id) if quote.plan.maker_side == OrderSide.SELL else (quote.maker.id, quote.hedge.id)
         if signal is not None and signal.long_leg.exchange_id == long_id and signal.short_leg.exchange_id == short_id:
             quote.signal_at = now
+            quote.funding_cost = funding_cost_percent(signal, options.funding_periods_in_net)
 
         maker_ticker = self._find_ticker(quote.maker.id, quote.symbol)
         hedge_ticker = self._find_ticker(quote.hedge.id, quote.symbol)
@@ -1068,14 +1134,20 @@ class ArbTradeExecutor:
         # 2) снять: сигнал пропал дольше cancel_after_ms или котировки бирж устарели
         max_age = timedelta(seconds=self._config.current.symbols.max_ticker_age_seconds)
         reason: str | None = None
+        cooldown = MAKER_WITHDRAW_COOLDOWN
+        swing = self._volatility_bps(quote.symbol, (quote.maker.id, quote.hedge.id), options)
         if now - quote.signal_at > timedelta(milliseconds=mh.cancel_after_ms):
             reason = f"сигнал пропал дольше {mh.cancel_after_ms} мс"
         elif maker_ticker is None or hedge_ticker is None or not maker_ticker.is_tradable or not hedge_ticker.is_tradable:
             reason = "нет котировок"
         elif any(t.timestamp is not None and now - t.timestamp > max_age for t in (maker_ticker, hedge_ticker)):
             reason = "котировки устарели"
+        elif swing is not None:
+            # исполнение в дёргающемся рынке — почти всегда «против нас»: хедж уйдёт по сдвинувшейся цене
+            reason = f"рынок дёргается: размах цены {dec_str(swing.quantize(Decimal('0.1')))} bps за {mh.volatility_window_ms} мс"
+            cooldown = timedelta(milliseconds=max(0, mh.volatility_cooldown_ms))
         if reason is not None:
-            await self._withdraw_quote(quote, reason, options)
+            await self._withdraw_quote(quote, reason, options, cooldown)
             return
 
         # 3) переставить за котировкой хедж-биржи
@@ -1086,7 +1158,7 @@ class ArbTradeExecutor:
             hedge_ticker,
             _fees_of(quote.maker, quote.symbol),
             _fees_of(quote.hedge, quote.symbol),
-            target_net=self._maker_target(options),
+            target_net=self._maker_target(options) + quote.funding_cost,
             buffer=options.slippage_buffer_percent,
             include_fees=options.include_fees,
         )
@@ -1095,7 +1167,14 @@ class ArbTradeExecutor:
             return
         if deviation_bps(quote.plan.price, fresh.price) < mh.requote_threshold_bps:
             return
-        if now - quote.requoted_at < timedelta(milliseconds=mh.min_requote_interval_ms):
+        # котировка хеджа ушла ПРОТИВ заявки (её исполнение теперь дало бы меньше расчётного) — переставляем сразу,
+        # не дожидаясь min_requote_interval_ms: пауза между перестановками бережёт лимиты, а не наш спред
+        adverse = (
+            fresh.hedge_reference > quote.plan.hedge_reference
+            if quote.plan.maker_side == OrderSide.SELL
+            else fresh.hedge_reference < quote.plan.hedge_reference
+        )
+        if not adverse and now - quote.requoted_at < timedelta(milliseconds=mh.min_requote_interval_ms):
             return
         await self._requote_maker(quote, fresh, options, now)
 
@@ -1141,7 +1220,9 @@ class ArbTradeExecutor:
         if quote.leg is not None and quote.leg.filled > ZERO:
             await self._hedge_quote(quote, options)
 
-    async def _withdraw_quote(self, quote: _MakerQuote, reason: str, options: ArbitrageOptions) -> None:
+    async def _withdraw_quote(
+        self, quote: _MakerQuote, reason: str, options: ArbitrageOptions, cooldown: timedelta = MAKER_WITHDRAW_COOLDOWN
+    ) -> None:
         if quote.leg is not None:
             if not await self._cancel_maker_order(quote):
                 self._log.warning(f"[{quote.maker.display_name}] {quote.symbol}: заявка-мейкер не снята ({reason}) — повторю на следующем такте")
@@ -1149,7 +1230,7 @@ class ArbTradeExecutor:
             if quote.leg.filled > ZERO:
                 await self._hedge_quote(quote, options)
                 return
-        self._drop_quote(quote, MAKER_WITHDRAW_COOLDOWN)
+        self._drop_quote(quote, cooldown)
         self._log.info(
             f"{'[СИМУЛЯЦИЯ] ' if quote.simulated else ''}{quote.symbol}: заявка-мейкер на {quote.maker.display_name} снята — {reason} "
             f"(перестановок {quote.requotes})"
@@ -1242,6 +1323,7 @@ class ArbTradeExecutor:
             )
         self._register_position(estimate, long_leg, short_leg)
         self._log.info(f"{symbol}: вход maker + хедж за {elapsed_ms} мс от обнаружения исполнения, перестановок заявки {quote.requotes}")
+        self._warn_hedge_slippage(quote, hedge_leg.average_price or reference, maker_leg.average_price or quote.plan.price, options)
 
     def _maker_estimate(self, quote: _MakerQuote, long_leg: _LegState, short_leg: _LegState, hedge_reference: Decimal) -> SpreadEstimate:
         """Оценка-«сигнал» для регистрации позиции: цена мейкера и котировка хеджа в момент исполнения."""
@@ -1297,6 +1379,27 @@ class ArbTradeExecutor:
             f"[СИМУЛЯЦИЯ] Открыт арбитраж maker + хедж {quote.symbol}: {formatting.volume(quote.amount)} × лонг {long_id} "
             f"@ {formatting.price(entry_long)} / шорт {short_id} @ {formatting.price(entry_short)}, брутто {formatting.pct(gross)} "
             f"(расчёт при выставлении {formatting.pct(quote.plan.expected_net_percent)} нетто), перестановок {quote.requotes}"
+        )
+        self._warn_hedge_slippage(quote, hedge_price, quote.plan.price, options)
+
+    def _warn_hedge_slippage(self, quote: _MakerQuote, hedge_price: Decimal, maker_price: Decimal, options: ArbitrageOptions) -> None:
+        """
+        Хедж ушёл хуже котировки, от которой считалась цена мейкера, — громко в журнал: это не шум, а цена
+        входа «maker + хедж» (мейкер исполняется, когда рынок двинулся, и хедж догоняет уже сдвинувшуюся цену).
+        """
+        reference = quote.plan.hedge_reference
+        if reference <= ZERO or hedge_price <= ZERO:
+            return
+        worse = hedge_price - reference if quote.plan.hedge_side == OrderSide.BUY else reference - hedge_price
+        slip_bps = worse / reference * _TEN_THOUSAND
+        if slip_bps <= options.maker_hedge.hedge_slippage_warn_bps:
+            return
+        long_price, short_price = (hedge_price, maker_price) if quote.plan.maker_side == OrderSide.SELL else (maker_price, hedge_price)
+        gross = (short_price - long_price) / long_price * HUNDRED if long_price > ZERO else ZERO
+        self._log.warning(
+            f"{'[СИМУЛЯЦИЯ] ' if quote.simulated else ''}{quote.symbol}: хедж {quote.plan.hedge_side} на {quote.hedge.display_name} "
+            f"хуже расчёта на {dec_str(slip_bps.quantize(Decimal('0.1')))} bps ({formatting.price(reference)} → {formatting.price(hedge_price)}), "
+            f"брутто входа {formatting.pct(gross)} вместо расчётного нетто {formatting.pct(quote.plan.expected_net_percent)}"
         )
 
     # ------------------------- политика исполнения -------------------------

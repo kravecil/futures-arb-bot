@@ -24,7 +24,7 @@ from futures_arb_bot.core.abstractions import (
 )
 from futures_arb_bot.core.cancellation import CancellationToken, OperationCanceledError, delay
 from futures_arb_bot.core.clock import Clock
-from futures_arb_bot.core.domain.arbitrage import OpportunityLeg, SpreadEstimate
+from futures_arb_bot.core.domain.arbitrage import OpportunityLeg, SpreadEstimate, funding_cost_percent, net_funding_percent
 from futures_arb_bot.core.domain.enums import MarketDataSource
 from futures_arb_bot.core.domain.market_data import ExchangeFees, FetchTickersResult, TickerSnapshot
 from futures_arb_bot.core.domain.options import BotOptions
@@ -39,6 +39,9 @@ _FALLBACK_FEES = ExchangeFees(Decimal("0.1"), Decimal("0.05"))
 
 Fetched = list[tuple[ExchangeConnector, FetchTickersResult]]
 FundingMap = dict[str, Mapping[str, Decimal]]
+
+SCAN_DEBUG_EVERY_SECONDS = 10.0
+"""Как часто писать отладочную сводку скана (число тиков, длительность, размер книги)."""
 
 
 class DefaultArbitrageScanner:
@@ -78,6 +81,12 @@ class DefaultArbitrageScanner:
         self._compared_pairs = 0
         self._maker_candidates: list[SpreadEstimate] = []
         """Связки для входа «maker + хедж»: брутто по лучшим ценам ≥ maker_hedge.trigger_gross_percent."""
+        self._debug_logged_at: float | None = None
+        self._debug_ticks = 0
+        self._debug_tick_sum_ms = 0.0
+        self._debug_tick_max_ms = 0.0
+        self._debug_book = ""
+        """Сводка книги последнего тика для отладочной строки (пишется раз в SCAN_DEBUG_EVERY_SECONDS)."""
 
     @property
     def snapshot(self) -> DashboardSnapshot | None:
@@ -132,14 +141,16 @@ class DefaultArbitrageScanner:
         self._stats.record_scan_tick(total_fetched)
         self._stats.record_tick_duration(tick_ms)
         self._last_tick_ms = tick_ms
-        self._log.debug(f"[scan] тик {tick_ms:.0f} мс")
+        self._log_scan_debug(tick_ms)
         for estimate in estimates:
             self._stats.record_opportunity(estimate)
 
         top = estimates[: max(0, options.general.console_ui.top_rows)]
         self._snapshot = self._stats.build_dashboard(top, len(self._connectors), tracked_symbols)
 
-        above_spread = [e for e in estimates if e.net_percent >= options.arbitrage.min_spread_percent_up]
+        # платёжный фандинг пары — часть цены входа: спред должен покрыть и его (funding_periods_in_net выплат)
+        periods = options.arbitrage.funding_periods_in_net
+        above_spread = [e for e in estimates if e.net_percent - funding_cost_percent(e, periods) >= options.arbitrage.min_spread_percent_up]
 
         # фильтр по фандингу: чистый фандинг позиции за интервал = рейт шорта − рейт лонга;
         # строго ниже предела — фандинг съедает спред, и сделка пропускается целиком
@@ -180,6 +191,24 @@ class DefaultArbitrageScanner:
                     if net_funding is None or net_funding >= limit:
                         maker_candidates.append(candidate)
             await self._executor.process_maker_quotes(maker_candidates, by_exchange, ct)
+
+    def _log_scan_debug(self, tick_ms: float) -> None:
+        """
+        Отладочная сводка скана — раз в SCAN_DEBUG_EVERY_SECONDS, а не на каждом тике: при scan_interval_ms = 100
+        построчный вывод давал ~20 строк в секунду и 22 МБ журнала за 3 часа (разбор 27.10.2026).
+        """
+        self._debug_ticks += 1
+        self._debug_tick_sum_ms += tick_ms
+        self._debug_tick_max_ms = max(self._debug_tick_max_ms, tick_ms)
+        now = time.monotonic()
+        if self._debug_logged_at is not None and now - self._debug_logged_at < SCAN_DEBUG_EVERY_SECONDS:
+            return
+        average = self._debug_tick_sum_ms / self._debug_ticks
+        self._log.debug(f"[scan] тиков {self._debug_ticks}, тик средн. {average:.0f} / макс. {self._debug_tick_max_ms:.0f} мс; {self._debug_book}")
+        self._debug_logged_at = now
+        self._debug_ticks = 0
+        self._debug_tick_sum_ms = 0.0
+        self._debug_tick_max_ms = 0.0
 
     def _update_subscriptions(self, options: BotOptions) -> None:
         """
@@ -308,7 +337,7 @@ class DefaultArbitrageScanner:
         cross_exchange = [(symbol, quotes, max(t.quote_volume_24h for t in quotes.values())) for symbol, quotes in book.items() if len(quotes) >= 2]
 
         total = sum(len(result.tickers) for _, result in fetched)
-        self._log.debug(f"[scan] тикеров после фильтра бирж: {total}, символов в книге: {len(book)}, на ≥2 биржах: {len(cross_exchange)}")
+        self._debug_book = f"тикеров после фильтра бирж: {total}, символов в книге: {len(book)}, на ≥2 биржах: {len(cross_exchange)}"
 
         tracked_symbols = len(cross_exchange)
 
@@ -490,8 +519,4 @@ def _funding_of(funding: FundingMap, exchange_id: str, symbol: str) -> Decimal |
 
 def _net_funding_percent(candidate: SpreadEstimate) -> Decimal | None:
     """Чистый фандинг пары: рейт шорта − рейт лонга; None — хотя бы по одной ноге данных нет (fail-open)."""
-    long_rate = candidate.long_leg.funding_percent
-    short_rate = candidate.short_leg.funding_percent
-    if long_rate is None or short_rate is None:
-        return None
-    return short_rate - long_rate
+    return net_funding_percent(candidate)

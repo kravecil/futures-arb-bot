@@ -36,6 +36,26 @@ class SpreadEstimate:
     detected_at: datetime
 
 
+def net_funding_percent(estimate: SpreadEstimate) -> Decimal | None:
+    """Чистый фандинг пары за период: рейт шорта − рейт лонга; None — хотя бы по одной ноге данных нет."""
+    long_rate = estimate.long_leg.funding_percent
+    short_rate = estimate.short_leg.funding_percent
+    if long_rate is None or short_rate is None:
+        return None
+    return short_rate - long_rate
+
+
+def funding_cost_percent(estimate: SpreadEstimate, periods: Decimal) -> Decimal:
+    """
+    Плата за фандинг, которую надо покрыть спредом, %: |чистый фандинг| × periods, если пара платит (чистый < 0);
+    доход от фандинга и отсутствие данных — 0 (доход в спред не засчитываем: рейт может смениться до выплаты).
+    """
+    net = net_funding_percent(estimate)
+    if net is None or net >= ZERO or periods <= ZERO:
+        return ZERO
+    return -net * periods
+
+
 @dataclass(eq=False, slots=True)
 class PositionPair:
     """Пара встречных фьючерсных позиций (лонг + шорт), дельта-нейтральная связка."""

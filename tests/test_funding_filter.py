@@ -179,6 +179,7 @@ async def test_disabled_notifications_section_notifies_nothing():
 
 async def test_rate_equal_to_limit_passes_strictly_below_rejects():
     h = await create()
+    h.options.arbitrage.funding_periods_in_net = D(0)  # здесь проверяется только предел, без вычета фандинга из нетто
     h.long.funding_rates_percent[SYMBOL] = D(1)
     h.short.funding_rates_percent[SYMBOL] = D(0)  # чистый доход пары ровно −1 % — предел, не «ниже»
 
@@ -237,3 +238,32 @@ async def test_quote_age_of_signal_is_measured():
     assert snapshot is not None and snapshot.last_tick_ms is not None
     latency = h.scanner._stats.snapshot(NOW).latency
     assert latency is not None and latency.max_quote_age_ms == 2000
+
+
+# ------------------------- фандинг в нетто входа (funding_periods_in_net) -------------------------
+
+
+async def test_paying_funding_is_deducted_from_net_before_threshold():
+    # нетто по ценам 0.6 %, пара платит 0.25 % за период → 0.35 % < порога 0.4 % — сделки нет
+    h = await create()
+    h.long.funding_rates_percent[SYMBOL] = D("0.05")
+    h.short.funding_rates_percent[SYMBOL] = D("-0.2")
+
+    await h.scanner.scan_once(NONE)
+    assert h.executor.processed == []
+
+    h.options.arbitrage.funding_periods_in_net = D(0)  # без учёта — прежнее поведение
+    await h.scanner.scan_once(NONE)
+    assert len(h.executor.processed) == 1
+
+
+async def test_funding_income_is_not_added_to_net():
+    # пара получает фандинг: в нетто не засчитывается (рейт может смениться), но и не мешает
+    h = await create()
+    h.options.arbitrage.min_spread_percent_up = D("0.65")  # нетто по ценам 0.6 % — ниже порога
+    h.long.funding_rates_percent[SYMBOL] = D("-0.5")
+    h.short.funding_rates_percent[SYMBOL] = D("0.5")
+
+    await h.scanner.scan_once(NONE)
+
+    assert h.executor.processed == []

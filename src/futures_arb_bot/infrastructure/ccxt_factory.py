@@ -40,7 +40,26 @@ def instantiate(exchange_id: str, config: dict[str, Any]) -> Any:
     key = exchange_id.lower()
     if key not in SUPPORTED:
         raise ValueError(f"Неизвестный идентификатор биржи: {exchange_id}")
-    return getattr(ccxt_async, key)(config)
+    exchange = getattr(ccxt_async, key)(config)
+    _fix_ws_urls(key, exchange)
+    return exchange
+
+
+OKX_WS_LEGACY_PORT = ":8443/"
+
+
+def _fix_ws_urls(key: str, exchange: Any) -> None:
+    """
+    OKX выводит из работы порт 8443 у WebSocket («WebSocket port 8443 will be retired soon. Please migrate to port 443»,
+    код 64010 — с ним биржа сразу рвёт поток при подключении), а ccxt 4.5.85 всё ещё ходит на 8443. Боевой адрес
+    переводим на стандартный 443; демо-контур (urls.test) не трогаем. Тестнет включается позже set_sandbox_mode
+    и копирует urls.test в urls.api, так что правка на него не влияет.
+    """
+    if key != "okx":
+        return
+    api = getattr(exchange, "urls", {}).get("api")
+    if isinstance(api, dict) and isinstance(api.get("ws"), str) and OKX_WS_LEGACY_PORT in api["ws"]:
+        api["ws"] = api["ws"].replace(OKX_WS_LEGACY_PORT, "/")
 
 
 class CcxtExchangeFactory:

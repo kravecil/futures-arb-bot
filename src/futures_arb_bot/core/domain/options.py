@@ -173,6 +173,18 @@ class MakerHedgeOptions(ConfigModel):
     """Хедж — IOC-лимитка по котировке со смещением в сторону агрессии, bps (страховка от ухода цены)."""
     hedge_fallback_to_market: bool = True
     """IOC-хедж исполнился не полностью — добить остаток market; false — откатить мейкер-ногу."""
+    max_volatility_bps: Decimal = Decimal(30)
+    """
+    Размах средней цены (mid) на любой из двух бирж связки за volatility_window_ms больше этого — новая заявка
+    не ставится, висящая снимается: в дёргающемся рынке мейкер исполняется почти только «против нас», и хедж
+    уходит по уже сдвинувшейся цене (разбор 27.10.2026: BTW брутто +0.05 %, HUMA −0.21 % вместо +0.3 %), bps; 0 — не проверять.
+    """
+    volatility_window_ms: int = 3_000
+    """Окно для max_volatility_bps, мс."""
+    volatility_cooldown_ms: int = 5_000
+    """После снятия заявки из-за волатильности столько не ставить новую по этому символу, мс."""
+    hedge_slippage_warn_bps: Decimal = Decimal(10)
+    """Хедж исполнился хуже котировки, от которой считалась цена мейкера, больше чем на это — предупреждение в журнал, bps."""
 
     @field_validator("maker_exchanges", mode="before")
     @classmethod
@@ -196,6 +208,12 @@ class ArbitrageOptions(ConfigModel):
     slippage_buffer_percent: Decimal = Decimal("0.03")
     max_spread_percent: Decimal = Decimal(5)
     min_funding_rate_percent: Decimal = Decimal(-1)
+    funding_periods_in_net: Decimal = Decimal(1)
+    """
+    Сколько выплат фандинга вычитать из нетто входа, когда чистый фандинг пары платёжный (< 0): с порогом входа
+    сравнивается нетто − |фандинг| × N, и столько же закладывается в цену заявки-мейкера. Устойчивый спред часто
+    и есть плата за фандинг (разбор 27.10.2026: DOOD — нетто +0.34 % при фандинге −0.30…−0.44 % за период); 0 — не учитывать.
+    """
     order_execution_timeout_ms: int = 3_000
     rebalance_tolerance_percent: Decimal = Decimal("1.0")
     order_poll_interval_ms: int = 200

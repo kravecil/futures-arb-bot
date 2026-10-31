@@ -35,6 +35,7 @@ arbitrage:
   slippage_buffer_percent: 0.03
   max_spread_percent: 5.0       # спреды выше — аномалия, игнорируются
   min_funding_rate_percent: -0.3
+  funding_periods_in_net: 1     # платёжный фандинг пары × N вычитается из нетто входа (0 — не учитывать; разбор 27.10: DOOD)
   include_fees: true
   order_size_usd: 12             # номинал каждой ноги, USDT
   order_execution_timeout_ms: 2000
@@ -91,3 +92,8 @@ arbitrage:
     maker_exchanges: [bybit, okx] # где можно стоять мейкером (нужен post-only; пусто — любая с post-only)
     hedge_offset_bps: 30          # хедж — IOC-лимитка по котировке ± смещение
     hedge_fallback_to_market: true  # IOC добрал не всё — остаток market (false — откатить мейкер-ногу)
+    # Защита от исполнения «против нас» (разбор 27.10.2026: BTW брутто +0.05 %, HUMA −0.21 % вместо расчётных +0.3…0.4 %):
+    max_volatility_bps: 30        # размах mid на любой бирже связки за окно больше — заявку не ставить / снять (0 — не проверять)
+    volatility_window_ms: 3000    # окно для max_volatility_bps
+    volatility_cooldown_ms: 5000  # пауза по символу после снятия из-за волатильности
+    hedge_slippage_warn_bps: 10   # хедж хуже расчётной котировки больше чем на столько — предупреждение в журнал
