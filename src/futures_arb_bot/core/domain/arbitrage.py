@@ -21,6 +21,8 @@ class OpportunityLeg:
     funding_percent: Decimal | None = None
     quoted_at: datetime | None = None
     """Время котировки ноги (биржевое, а если биржа его не дала — время получения)."""
+    feed_lag_ms: float | None = None
+    """Отставание потока биржи по котировке ноги, мс (None — не измерялось)."""
 
 
 @dataclass(frozen=True, slots=True)

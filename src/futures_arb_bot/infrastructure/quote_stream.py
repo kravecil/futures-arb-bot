@@ -36,6 +36,46 @@ _QUOTE_HASH_PREFIXES = ("bidask", "ticker")
 
 _MAX_RECONNECT_GAP_SECONDS = 60.0
 
+LAG_WINDOW_SECONDS = 30.0
+"""Окно базы отставания: база — минимум задержки за текущее и предыдущее окно (30–60 с)."""
+
+
+class FeedLagMeter:
+    """
+    Отставание потока биржи по биржевому времени сообщений.
+
+    Задержка сообщения d = (момент получения по монотонным часам) − (биржевое время сообщения).
+    В d сидят неизвестная константа (смещение часов сервера и биржи) и сетевая задержка, поэтому
+    само d ничего не говорит. База — минимум d по бирже за последние 30–60 с, то есть задержка
+    «самого быстрого» сообщения; отставание = d − база. Так смещение часов вычитается само (NTP
+    не нужен), а ступенька системных часов не влияет — получение меряется монотонными часами.
+
+    Зачем: 02.11.2026 поток OKX отдавал старые цены (на 0.5–1.1% от стакана), а возраст котировок
+    по моменту получения был 2–490 мс — 22 фантомных сигнала, ни одного реального.
+    """
+
+    def __init__(self, window_seconds: float = LAG_WINDOW_SECONDS) -> None:
+        self._window = window_seconds
+        self._window_start: float | None = None
+        self._current_min: float | None = None
+        self._previous_min: float | None = None
+
+    def measure(self, exchange_ms: Any, received_monotonic: float) -> float | None:
+        """Отставание сообщения, мс; None — биржа не дала время сообщения."""
+        if isinstance(exchange_ms, bool) or not isinstance(exchange_ms, (int, float)) or exchange_ms <= 0:
+            return None
+        delay = received_monotonic * 1000 - float(exchange_ms)
+        start = self._window_start
+        if start is None or received_monotonic - start >= self._window:
+            # предыдущее окно годится в базу, только если оно было непосредственно перед текущим
+            adjacent = start is not None and received_monotonic - start < 2 * self._window
+            self._previous_min = self._current_min if adjacent else None
+            self._current_min = None
+            self._window_start = received_monotonic
+        self._current_min = delay if self._current_min is None else min(self._current_min, delay)
+        base = self._current_min if self._previous_min is None else min(self._previous_min, self._current_min)
+        return max(0.0, delay - base)
+
 
 class QuoteStream:
     def __init__(self, api: Any, exchange_id: str, display_name: str, log: EventLog, clock: Clock) -> None:
@@ -54,7 +94,8 @@ class QuoteStream:
             self._method = None
         self._symbols: set[str] = set()
         self._tasks: list[asyncio.Task[None]] = []
-        self._raw: dict[str, tuple[float, float, float | None, datetime]] = {}
+        self._raw: dict[str, tuple[float, float, float | None, datetime, float | None]] = {}
+        self._lag = FeedLagMeter()
         self._last_message: float | None = None
         self._last_message_at: datetime | None = None
         self._started_at: float | None = None
@@ -122,10 +163,10 @@ class QuoteStream:
         лучше пропустить сделку, чем войти по старой цене. Оборот за 24 ч берётся из последнего снимка REST.
         """
         result: dict[str, TickerSnapshot] = {}
-        for symbol, (bid, ask, last, as_of) in self._raw.items():
+        for symbol, (bid, ask, last, as_of, lag_ms) in self._raw.items():
             bid_d = to_dec(bid)
             result[symbol] = TickerSnapshot(
-                self._exchange_id, symbol, bid_d, to_dec(ask), to_dec(last) if last else bid_d, volumes.get(symbol, ZERO), as_of
+                self._exchange_id, symbol, bid_d, to_dec(ask), to_dec(last) if last else bid_d, volumes.get(symbol, ZERO), as_of, lag_ms
             )
         return result
 
@@ -212,6 +253,7 @@ class QuoteStream:
         if not isinstance(updates, Mapping):
             return
         received = self._clock.now()
+        received_monotonic = time.monotonic()
         applied = False
         for symbol, ticker in updates.items():
             if not isinstance(ticker, Mapping):
@@ -221,10 +263,12 @@ class QuoteStream:
             if not isinstance(bid, (int, float)) or not isinstance(ask, (int, float)) or bid <= 0 or ask <= 0:
                 continue
             # время котировки — момент её получения: метка биржи у части каналов — время последней
-            # сделки, а не стакана, и вдобавок зависит от расхождения часов
+            # сделки, а не стакана, и вдобавок зависит от расхождения часов. Биржевая метка идёт
+            # только в отставание потока, где смещение часов вычитается (см. FeedLagMeter)
             stamp = received
+            lag_ms = self._lag.measure(ticker.get("timestamp"), received_monotonic)
             last = ticker.get("last")
-            self._raw[symbol] = (float(bid), float(ask), float(last) if isinstance(last, (int, float)) else None, stamp)
+            self._raw[symbol] = (float(bid), float(ask), float(last) if isinstance(last, (int, float)) else None, stamp, lag_ms)
             applied = True
         if applied:
             self._forced_gap = None  # поток ожил — следующий сброс снова через обычную паузу

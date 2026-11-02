@@ -48,6 +48,9 @@ class TickerSnapshot:
     last: Decimal
     quote_volume_24h: Decimal
     timestamp: datetime | None
+    feed_lag_ms: float | None = None
+    """Отставание потока по этой котировке, мс: насколько позже обычного она дошла от биржи
+    (по биржевому времени сообщения). None — не измерялось (REST, биржа не дала время)."""
 
     @property
     def mid(self) -> Decimal:

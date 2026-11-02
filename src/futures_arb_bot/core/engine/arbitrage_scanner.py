@@ -87,6 +87,10 @@ class DefaultArbitrageScanner:
         self._debug_tick_max_ms = 0.0
         self._debug_book = ""
         """Сводка книги последнего тика для отладочной строки (пишется раз в SCAN_DEBUG_EVERY_SECONDS)."""
+        self._debug_lag_max_ms: dict[str, float] = {}
+        """Наибольшее отставание потока по бирже за период отладочной строки, мс."""
+        self._debug_lag_dropped: dict[str, int] = {}
+        """Сколько котировок биржи за период отброшено из-за отставания потока."""
 
     @property
     def snapshot(self) -> DashboardSnapshot | None:
@@ -204,11 +208,26 @@ class DefaultArbitrageScanner:
         if self._debug_logged_at is not None and now - self._debug_logged_at < SCAN_DEBUG_EVERY_SECONDS:
             return
         average = self._debug_tick_sum_ms / self._debug_ticks
-        self._log.debug(f"[scan] тиков {self._debug_ticks}, тик средн. {average:.0f} / макс. {self._debug_tick_max_ms:.0f} мс; {self._debug_book}")
+        self._log.debug(
+            f"[scan] тиков {self._debug_ticks}, тик средн. {average:.0f} / макс. {self._debug_tick_max_ms:.0f} мс; {self._debug_book}{self._lag_debug_text()}"
+        )
+        self._debug_lag_max_ms = {}
+        self._debug_lag_dropped = {}
         self._debug_logged_at = now
         self._debug_ticks = 0
         self._debug_tick_sum_ms = 0.0
         self._debug_tick_max_ms = 0.0
+
+    def _lag_debug_text(self) -> str:
+        """«; отставание потока: okx макс. 950 мс (отброшено 12), bybit макс. 20 мс» — пусто, если не измерялось."""
+        if not self._debug_lag_max_ms:
+            return ""
+        parts = []
+        for exchange_id in sorted(self._debug_lag_max_ms):
+            dropped = self._debug_lag_dropped.get(exchange_id, 0)
+            suffix = f" (отброшено {dropped})" if dropped else ""
+            parts.append(f"{exchange_id} макс. {self._debug_lag_max_ms[exchange_id]:.0f} мс{suffix}")
+        return "; отставание потока: " + ", ".join(parts)
 
     def _update_subscriptions(self, options: BotOptions) -> None:
         """
@@ -313,6 +332,7 @@ class DefaultArbitrageScanner:
         volume_minimum = symbols_options.min_quote_volume24h_usd
         max_age = timedelta(seconds=symbols_options.max_ticker_age_seconds)
         max_skew = timedelta(seconds=symbols_options.max_ticker_skew_seconds)
+        max_lag_ms = options.general.market_data.max_feed_lag_ms
         now = self._clock.now()
 
         book: dict[str, dict[str, TickerSnapshot]] = {}
@@ -331,6 +351,17 @@ class DefaultArbitrageScanner:
 
                 if ticker.timestamp is not None and ticker.timestamp < now - max_age:
                     continue
+
+                # котировка пришла свежей, но биржа отправила её заметно раньше обычного — цена старая
+                lag = ticker.feed_lag_ms
+                if lag is not None:
+                    if lag > self._debug_lag_max_ms.get(connector.id, 0.0):
+                        self._debug_lag_max_ms[connector.id] = lag
+                    else:
+                        self._debug_lag_max_ms.setdefault(connector.id, 0.0)
+                    if max_lag_ms > 0 and lag > max_lag_ms:
+                        self._debug_lag_dropped[connector.id] = self._debug_lag_dropped.get(connector.id, 0) + 1
+                        continue
 
                 book.setdefault(symbol, {})[connector.id] = ticker
 
@@ -430,8 +461,8 @@ class DefaultArbitrageScanner:
 
             estimate = replace(
                 estimate,
-                long_leg=replace(estimate.long_leg, quoted_at=cheaper.timestamp),
-                short_leg=replace(estimate.short_leg, quoted_at=richer.timestamp),
+                long_leg=replace(estimate.long_leg, quoted_at=cheaper.timestamp, feed_lag_ms=cheaper.feed_lag_ms),
+                short_leg=replace(estimate.short_leg, quoted_at=richer.timestamp, feed_lag_ms=richer.feed_lag_ms),
             )
 
             estimates.append(estimate)
@@ -500,7 +531,11 @@ def _ages_text(candidate: SpreadEstimate, now: datetime) -> str:
     if long_age is None and short_age is None:
         return ""
     fmt = lambda a: "н/д" if a is None else f"{a:.0f}"  # noqa: E731
-    return f", возраст котировок {fmt(long_age)}/{fmt(short_age)} мс"
+    text = f", возраст котировок {fmt(long_age)}/{fmt(short_age)} мс"
+    long_lag, short_lag = candidate.long_leg.feed_lag_ms, candidate.short_leg.feed_lag_ms
+    if long_lag is not None or short_lag is not None:
+        text += f", отставание потока {fmt(long_lag)}/{fmt(short_lag)} мс"
+    return text
 
 
 def _reraise_first(results: list[object]) -> None:
