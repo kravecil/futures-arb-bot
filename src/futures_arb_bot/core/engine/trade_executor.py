@@ -215,6 +215,10 @@ class ArbTradeExecutor:
         self._stray_orders: list[_StrayOrder] = []
         self._reconcile_fail_warned: set[str] = set()
         self._last_reconcile_at: datetime | None = None
+        self._exposure_known = False
+        """Сверка с биржами хотя бы раз завершилась — до этого входить по памяти сеанса нельзя (рестарт)."""
+        self._reconcile_task: asyncio.Task[None] | None = None
+        """Фоновая сверка позиций: она идёт вне пути входа, а вход берёт её последний результат."""
         self._last_tickers: dict[str, dict[str, TickerSnapshot]] = {}
         self._markets_cache: dict[str, dict[str, MarketInfo]] = {}
         self._streaks: dict[_StreakKey, int] = {}
@@ -260,6 +264,8 @@ class ArbTradeExecutor:
         # устойчивость сигнала: связка должна продержаться confirm_scans сканов подряд — одиночный
         # «скачок» из-за запоздавшей котировки одной из бирж в сделку не превращается
         self._streaks = {key: self._streaks.get(key, 0) + 1 for key in {_streak_key(c) for c in candidates}}
+        # сверка позиций обновляется в фоне и без сигналов — к моменту сигнала её результат уже готов
+        self._schedule_exposure_refresh(ct)
         if not candidates:
             return
 
@@ -585,6 +591,8 @@ class ArbTradeExecutor:
             reject(f"стакан {missing} недоступен")
             return None
 
+        # сколько прошло от скана с сигналом до стаканов на руках — видно, успевает ли проверка за спредом
+        book_delay_ms = max(0.0, (self._clock.now() - estimate.detected_at).total_seconds() * 1000)
         buy = _sweep(long_book, OrderSide.BUY, amount)
         sell = _sweep(short_book, OrderSide.SELL, amount)
         if buy is None or sell is None:
@@ -599,7 +607,7 @@ class ArbTradeExecutor:
             reject(
                 f"спред не подтвердился стаканом: по котировкам нетто {formatting.pct(estimate.net_percent)}, "
                 f"по стакану {formatting.pct(net)} (купить {long_connector.id} @ {formatting.price(buy)}, "
-                f"продать {short_connector.id} @ {formatting.price(sell)})"
+                f"продать {short_connector.id} @ {formatting.price(sell)}; стаканы через {book_delay_ms:.0f} мс после скана)"
             )
             return None
 
@@ -2041,38 +2049,79 @@ class ArbTradeExecutor:
         """
         Сверка с биржами: лимиты должны учитывать фактическую экспозицию, а не только позиции сеанса —
         иначе после рестарта бот открывал «ещё одну» поверх живой. Символы своих позиций исключаются.
+
+        Запросы fetch_positions стояли прямо на пути входа: раз в минуту сигнал ждал два приватных
+        REST-запроса подряд, и стакан проверялся через 1.4–2.4 с после сигнала вместо 0.5 с
+        (02–03.11.2026) — короткий спред к этому моменту исчезал. Теперь сверка обновляется в фоне,
+        а вход берёт её последний результат; ждать приходится только самую первую сверку сеанса.
         """
         if self._config.current.general.network_mode == NetworkMode.DRY_RUN:
             return  # симуляция не выставляет заявок на биржу — сверяться не с чем
 
+        if self._exposure_known:
+            self._schedule_exposure_refresh(ct)
+            return
+
+        task = self._reconcile_task
+        if task is not None and not task.done():
+            await asyncio.shield(task)  # первая сверка уже идёт в фоне — дождаться её, а не запускать вторую
+        else:
+            await self._refresh_external_exposure(ct)
+
+    def _schedule_exposure_refresh(self, ct: CancellationToken) -> None:
+        """Запустить фоновую сверку, если прошлая устарела (не чаще раза в RECONCILE_INTERVAL) и не идёт сейчас."""
+        if self._config.current.general.network_mode == NetworkMode.DRY_RUN or ct.is_cancellation_requested:
+            return
+        task = self._reconcile_task
+        if task is not None and not task.done():
+            return
         now = self._clock.now()
         if self._last_reconcile_at is not None and now - self._last_reconcile_at < RECONCILE_INTERVAL:
-            return  # не чаще раза в минуту: fetch_positions — приватный запрос
+            return
+        self._last_reconcile_at = now  # сразу: следующий скан не запустит вторую сверку
+        self._reconcile_task = asyncio.get_running_loop().create_task(self._refresh_in_background(ct), name="reconcile-exposure")
 
-        self._last_reconcile_at = now
+    async def _refresh_in_background(self, ct: CancellationToken) -> None:
+        try:
+            await self._refresh_external_exposure(ct)
+        except OperationCanceledError:
+            pass
+        except Exception as ex:
+            self._logger.debug("фоновая сверка позиций не удалась", exc_info=ex)
+
+    async def _refresh_external_exposure(self, ct: CancellationToken) -> None:
+        """Запросить позиции всех бирж (параллельно) и обновить экспозицию вне учёта сеанса."""
+        self._last_reconcile_at = self._clock.now()
 
         # снимок прошлой сверки: при сбое запроса сохраняем известную экспозицию
         previous = {k: set(v) for k, v in self._external_exposure.items()}
 
-        fresh: dict[str, set[str]] = {}
-        for connector in self._registry.connectors:
+        async def fetch(connector: ExchangeConnector) -> tuple[ExchangeConnector, set[str] | None, Exception | None]:
             try:
                 positions = await connector.fetch_positions(ct)
-                symbols = {p.symbol for p in positions if p.amount > ZERO}
-                if symbols:
-                    fresh[connector.id] = symbols
+                return connector, {p.symbol for p in positions if p.amount > ZERO}, None
             except OperationCanceledError:
                 raise
             except Exception as ex:
-                if connector.id not in self._reconcile_fail_warned:
-                    self._reconcile_fail_warned.add(connector.id)
-                    self._log.warning(
-                        f"[{connector.display_name}] сверка позиций недоступна: {message_of(ex)} — лимиты считаются только по позициям сеанса"
-                    )
-                self._logger.debug(f"FetchPositions reconcile failed on {connector.id}", exc_info=ex)
-                stale = previous.get(connector.id)
-                if stale is not None:
-                    fresh[connector.id] = stale  # консервативно: помним прошлый результат
+                return connector, None, ex
+
+        results = await asyncio.gather(*(fetch(c) for c in self._registry.connectors))
+
+        fresh: dict[str, set[str]] = {}
+        for connector, symbols, error in results:
+            if error is None:
+                if symbols:
+                    fresh[connector.id] = symbols
+                continue
+            if connector.id not in self._reconcile_fail_warned:
+                self._reconcile_fail_warned.add(connector.id)
+                self._log.warning(
+                    f"[{connector.display_name}] сверка позиций недоступна: {message_of(error)} — лимиты считаются только по позициям сеанса"
+                )
+            self._logger.debug(f"FetchPositions reconcile failed on {connector.id}", exc_info=error)
+            stale = previous.get(connector.id)
+            if stale is not None:
+                fresh[connector.id] = stale  # консервативно: помним прошлый результат
 
         for position in self._positions.values():
             longs = fresh.get(position.long_exchange_id)
@@ -2084,6 +2133,7 @@ class ArbTradeExecutor:
 
         report = not self._external_exposure and any(fresh.values())
         self._external_exposure = {k: v for k, v in fresh.items() if v}
+        self._exposure_known = True
 
         if report:
             description = "; ".join(f"{k}: {', '.join(sorted(v))}" for k, v in sorted(fresh.items()) if v)
